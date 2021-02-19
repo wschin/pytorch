@@ -65,6 +65,19 @@ def make_stubs_from_exported_methods(mod):
 
     return stubs
 
+def is_jit_ignored_property(module, prop):
+    user_annotated_ignored_attributes = getattr(module, "__jit_ignored_attributes__", list())
+
+    def get_properties_names(module):
+        return set(k for k, v in vars(module).items() if isinstance(v, property))
+
+    properties = get_properties_names(type(module))
+    user_annoted_ignored_properties = set()
+
+    for ignored_attr in user_annotated_ignored_attributes:
+        if ignored_attr in properties:
+            user_annoted_ignored_properties.add(ignored_attr)
+    return prop in user_annoted_ignored_properties
 
 # base types that can be constants
 # in addition, tuples and lists of these base types are also considered constants
@@ -411,6 +424,8 @@ def create_script_module_impl(nn_module, concrete_type, stubs_fn):
     property_stubs = get_property_stubs(nn_module)
     hook_stubs, pre_hook_stubs = get_hook_stubs(nn_module)
 
+    user_annotated_ignored_attributes = getattr(nn_module, "__jit_ignored_attributes__", list())
+
     def init_fn(script_module):
         # Initialize the ScriptModule:
         # 1. Copy the attributes/parameters/buffers from the original `nn_module` to the new ScriptModule.
@@ -440,6 +455,8 @@ def create_script_module_impl(nn_module, concrete_type, stubs_fn):
         # 3. Copy @ignored/@unused methods and attrs from the original `nn_module` to the new ScriptModule.
         #    This ensures we can access these Python methods on the ScriptModule.
         for name in dir(nn_module):
+            if is_jit_ignored_property(nn_module, name):
+                continue
             item = getattr(nn_module, name, None)
             if inspect.ismethod(item) and _jit_internal.is_ignored_fn(item):
                 unbound_function = getattr(type(nn_module), name)
@@ -521,6 +538,8 @@ def create_script_module_impl(nn_module, concrete_type, stubs_fn):
     # copy over python methods to script module if they aren't defined on the script module
     # this is currently an internal api used only on module containers
     for name in dir(nn_module):
+        if is_jit_ignored_property(nn_module, name):
+            continue
         item = getattr(nn_module, name, None)
         if _jit_internal.get_torchscript_modifier(item) is _jit_internal.FunctionModifiers.COPY_TO_SCRIPT_WRAPPER:
             add_python_attr_to_scripted_model(script_module, nn_module, name)
@@ -549,6 +568,8 @@ def get_overload_annotations(mod):
     overloads = {}
 
     for name in dir(type(mod)):
+        if is_jit_ignored_property(mod, name):
+            continue
         item = getattr(mod, name, None)
         if not callable(item):
             continue
@@ -618,6 +639,7 @@ def infer_methods_to_compile(nn_module):
     points for compilation (TODO add a link when the rules are published).
     """
     check_module_initialized(nn_module)
+    user_annotated_ignored_attributes = getattr(nn_module, "__jit_ignored_attributes__", list())
 
     methods: List[str] = []
     if hasattr(nn_module, 'forward') and not _jit_internal.is_ignored_fn(nn_module.forward):
@@ -628,6 +650,8 @@ def infer_methods_to_compile(nn_module):
 
     exported = []
     for name in dir(nn_module):
+        if is_jit_ignored_property(nn_module, name):
+            continue
         item = getattr(nn_module, name, None)
         if _jit_internal.get_torchscript_modifier(item) is _jit_internal.FunctionModifiers.EXPORT:
             exported.append(name)
