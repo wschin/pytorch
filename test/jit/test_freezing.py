@@ -1559,3 +1559,33 @@ class TestFrozenOptimizations(JitTestCase):
         output_s = mod.forward(input)
         output_f = frozen_mod.forward(input)
         self.assertEqual(output_s, output_f)
+
+    def test_freeze_conv_relu_fusion(self):
+        class Net(nn.Module):
+            def __init__(self, num_classes: int = 1000) -> None:
+                super(Net, self).__init__()
+                self.conv = nn.Sequential(
+                    nn.Conv2d(1, 4, kernel_size=3, stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.MaxPool2d(kernel_size=2, stride=2),
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.conv(x)
+                return x
+
+        mod = torch.jit.script(Net().eval())
+        # inspect frozen mod
+        torch._C._jit_pass_inline(mod.graph)
+        FileCheck().check("aten::relu").run(mod.graph)
+        frozen_mod = torch.jit.freeze(mod, optimize_numerics=False)
+        torch._C._jit_pass_remove_mutation(frozen_mod.graph)
+        print(frozen_mod.graph)
+        torch._C._jit_pass_fuse_frozen_conv_relu(frozen_mod.graph)
+        print(frozen_mod.graph)
+        #FileCheck().check_not("aten::relu").run(frozen_mod.graph)
+
+        input = torch.randn(10, 1, 8, 8)
+        output_s = mod.forward(input)
+        output_f = frozen_mod.forward(input)
+        self.assertEqual(output_s, output_f)
