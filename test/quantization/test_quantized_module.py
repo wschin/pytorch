@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.intrinsic as nni
-import torch.nn.intrinsic.quantized as nnq_fused
+import torch.nn.intrinsic.quantized as nniq
 import torch.nn.intrinsic.quantized._reference as nniqr
 import torch.nn.quantized as nnq
 import torch.nn.quantized._reference as nnqr
@@ -83,7 +83,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         # (use_fused, reference) -> quantized class
         class_map = {
             (True, True) : nniqr.LinearReLU,
-            (True, False) : nnq_fused.LinearReLU,
+            (True, False) : nniq.LinearReLU,
             (False, True) : nnqr.Linear,
             (False, False) : nnq.Linear,
         }
@@ -232,7 +232,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         in_channels_per_group, input_feature_map_size, out_channels_per_group,
         groups, kernel_size, stride, padding, padding_mode, dilation,
         X_scale, X_zero_point, W_scale, W_zero_point, Y_scale, Y_zero_point,
-        use_bias, use_fused, use_channelwise,
+        use_bias, use_fused, use_channelwise, reference
     ):
         for i in range(len(kernel_size)):
             assume(input_feature_map_size[i] + 2 * padding[i]
@@ -259,8 +259,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                 conv_module.bias.data = b
 
         # Test members
-        self.assertTrue(module_name in str(qconv_module))
-        self.assertTrue(hasattr(qconv_module, '_packed_params'))
+        self.assertTrue(module_name == qconv_module._get_name(), module_name + " " + qconv_module._get_name())
+        if not reference:
+            self.assertTrue(hasattr(qconv_module, '_packed_params'))
         self.assertTrue(hasattr(qconv_module, 'scale'))
         self.assertTrue(hasattr(qconv_module, 'zero_point'))
 
@@ -308,8 +309,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         loaded_qconv_module.load_state_dict(loaded_dict)
 
         self.assertTrue(dir(loaded_qconv_module) == dir(qconv_module))
-        self.assertTrue(module_name in str(loaded_qconv_module))
-        self.assertTrue(hasattr(loaded_qconv_module, '_packed_params'))
+        self.assertTrue(module_name == loaded_qconv_module._get_name())
+        if not reference:
+            self.assertTrue(hasattr(loaded_qconv_module, '_packed_params'))
         self.assertTrue(hasattr(loaded_qconv_module, '_weight_bias'))
 
         self.assertEqual(qconv_module.weight(), loaded_qconv_module.weight())
@@ -354,69 +356,73 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                 self.assertEqual(conv_module.bias,
                                  converted_qconv_module[0].bias())
         # Smoke test extra_repr
-        self.assertTrue(module_name in str(converted_qconv_module))
+        self.assertTrue(module_name == converted_qconv_module._get_name())
 
-    @given(batch_size=st.integers(1, 3),
-           in_channels_per_group=st.sampled_from([2, 4, 5, 8, 16, 32]),
-           length=st.integers(4, 16),
-           out_channels_per_group=st.sampled_from([2, 4, 5, 8, 16, 32]),
-           groups=st.integers(1, 4),
-           kernel=st.integers(1, 7),
-           stride=st.integers(1, 2),
-           pad_mode=st.sampled_from(['zeros', 'reflect']),
-           pad=st.integers(0, 2),
-           dilation=st.integers(1, 2),
-           X_scale=st.floats(1.2, 1.6),
-           X_zero_point=st.integers(0, 4),
-           W_scale=st.lists(st.floats(0.2, 1.6), min_size=1, max_size=2),
-           W_zero_point=st.lists(st.integers(-5, 5), min_size=1, max_size=2),
-           Y_scale=st.floats(4.2, 5.6),
-           Y_zero_point=st.integers(0, 4),
-           use_bias=st.booleans(),
-           use_fused=st.booleans(),
-           use_channelwise=st.booleans())
     @override_qengines
-    def test_conv1d_api(
-        self, batch_size, in_channels_per_group, length, out_channels_per_group,
-        groups, kernel, stride, pad_mode, pad, dilation,
-        X_scale, X_zero_point, W_scale, W_zero_point, Y_scale, Y_zero_point,
-        use_bias, use_fused, use_channelwise
-    ):
-        # Tests the correctness of the conv2d module.
-        in_channels = in_channels_per_group * groups
-        out_channels = out_channels_per_group * groups
-        input_feature_map_size = (length,)
-        kernel_size = (kernel, )
-        stride = (stride, )
-        pad = (pad, )
-        dilation = (dilation, )
-        if torch.backends.quantized.engine == 'qnnpack':
-            use_channelwise = False
-        if use_fused:
-            module_name = "QuantizedConvReLU1d"
-            qconv_module = nnq_fused.ConvReLU1d(
+    def test_conv1d_api(self):
+        options = itertools.product(
+            [1, 3],  # batch_size
+            [2, 5, 8, 32],  # in_channels_per_group
+            [4, 16],  # length
+            [2, 5, 8, 32],  # out_channels_per_group
+            [1, 3],  # groups
+            [1, 3, 6],  # kernel
+            [1, 2],  # stride
+            ["zeros", "reflect"],  # pad_mode
+            [0, 1],  # pad
+            [1, 2],  # dilation
+            [True, False],  # use_bias
+            [True, False],  # use_fused
+            [True, False],  # use_channelwise
+            [True, False]  # reference
+        )
+        for batch_size, in_channels_per_group, length, out_channels_per_group, \
+            groups, kernel, stride, pad_mode, pad, dilation, \
+            use_bias, use_fused, use_channelwise, reference in options:
+            # Tests the correctness of the conv2d module.
+            in_channels = in_channels_per_group * groups
+            out_channels = out_channels_per_group * groups
+            input_feature_map_size = (length,)
+            kernel_size = (kernel, )
+            stride = (stride, )
+            pad = (pad, )
+            dilation = (dilation, )
+            X_scale = 1.3
+            X_zero_point = 2
+            W_scale = [0.5]
+            W_zero_point = [3]
+            Y_scale = 5.0
+            Y_zero_point = 4
+            if torch.backends.quantized.engine == 'qnnpack':
+                use_channelwise = False
+            # (use_fused, reference) -> quantized class
+            class_map = {
+                (True, True): (nniqr.ConvReLU1d, "QuantizedConvReLU1d(Reference)"),
+                (True, False): (nniq.ConvReLU1d, "QuantizedConvReLU1d"),
+                (False, True): (nnqr.Conv1d, "QuantizedConv1d(Reference)"),
+                (False, False): (nnq.Conv1d, "QuantizedConv1d")
+            }
+
+            qconv_cls, module_name = class_map[(use_fused, reference)]
+            qconv_module = qconv_cls(
+                in_channels, out_channels, kernel, stride, pad,
+                dilation, groups, use_bias, padding_mode=pad_mode
+            )
+
+            conv_module = nn.Conv1d(
                 in_channels, out_channels, kernel, stride, pad,
                 dilation, groups, use_bias, padding_mode=pad_mode)
-        else:
-            module_name = "QuantizedConv1d"
-            qconv_module = nnq.Conv1d(
-                in_channels, out_channels, kernel, stride, pad,
-                dilation, groups, use_bias, padding_mode=pad_mode)
+            if use_fused:
+                relu_module = nn.ReLU()
+                conv_module = nni.ConvReLU1d(conv_module, relu_module)
+            conv_module = conv_module.float()
 
-        conv_module = nn.Conv1d(
-            in_channels, out_channels, kernel, stride, pad,
-            dilation, groups, use_bias, padding_mode=pad_mode)
-        if use_fused:
-            relu_module = nn.ReLU()
-            conv_module = nni.ConvReLU1d(conv_module, relu_module)
-        conv_module = conv_module.float()
-
-        self._test_conv_api_impl(
-            module_name, qconv_module, conv_module, batch_size,
-            in_channels_per_group, input_feature_map_size,
-            out_channels_per_group, groups, kernel_size, stride, pad, pad_mode,
-            dilation, X_scale, X_zero_point, W_scale, W_zero_point, Y_scale,
-            Y_zero_point, use_bias, use_fused, use_channelwise)
+            self._test_conv_api_impl(
+                module_name, qconv_module, conv_module, batch_size,
+                in_channels_per_group, input_feature_map_size,
+                out_channels_per_group, groups, kernel_size, stride, pad, pad_mode,
+                dilation, X_scale, X_zero_point, W_scale, W_zero_point, Y_scale,
+                Y_zero_point, use_bias, use_fused, use_channelwise, reference)
 
     @given(batch_size=st.integers(1, 3),
            in_channels_per_group=st.sampled_from([2, 4, 5, 8, 16, 32]),
@@ -440,13 +446,14 @@ class TestStaticQuantizedModule(QuantizationTestCase):
            Y_zero_point=st.integers(0, 4),
            use_bias=st.booleans(),
            use_fused=st.booleans(),
-           use_channelwise=st.booleans())
+           use_channelwise=st.booleans(),
+           reference=st.booleans())
     @override_qengines
     def test_conv2d_api(
         self, batch_size, in_channels_per_group, H, W, out_channels_per_group,
         groups, kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w, pad_mode,
         dilation, X_scale, X_zero_point, W_scale, W_zero_point, Y_scale,
-        Y_zero_point, use_bias, use_fused, use_channelwise
+        Y_zero_point, use_bias, use_fused, use_channelwise, reference
     ):
         # Tests the correctness of the conv2d module.
         in_channels = in_channels_per_group * groups
@@ -456,16 +463,20 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         stride = (stride_h, stride_w)
         padding = (pad_h, pad_w)
         dilation = (dilation, dilation)
-        if use_fused:
-            module_name = "QuantizedConvReLU2d"
-            qconv_module = nnq_fused.ConvReLU2d(
-                in_channels, out_channels, kernel_size, stride, padding,
-                dilation, groups, use_bias, padding_mode=pad_mode)
-        else:
-            module_name = "QuantizedConv2d"
-            qconv_module = nnq.Conv2d(
-                in_channels, out_channels, kernel_size, stride, padding,
-                dilation, groups, use_bias, padding_mode=pad_mode)
+
+        # (use_fused, reference) -> quantized class
+        class_map = {
+            (True, True): (nniqr.ConvReLU2d, "QuantizedConvReLU2d(Reference)"),
+            (True, False): (nniq.ConvReLU2d, "QuantizedConvReLU2d"),
+            (False, True): (nnqr.Conv2d, "QuantizedConv2d(Reference)"),
+            (False, False): (nnq.Conv2d, "QuantizedConv2d")
+        }
+
+        qconv_cls, module_name = class_map[(use_fused, reference)]
+        qconv_module = qconv_cls(
+            in_channels, out_channels, kernel_size, stride, padding,
+            dilation, groups, use_bias, padding_mode=pad_mode
+        )
 
         conv_module = nn.Conv2d(
             in_channels, out_channels, kernel_size, stride, padding,
@@ -480,7 +491,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
             in_channels_per_group, input_feature_map_size,
             out_channels_per_group, groups, kernel_size, stride, padding,
             pad_mode, dilation, X_scale, X_zero_point, W_scale, W_zero_point,
-            Y_scale, Y_zero_point, use_bias, use_fused, use_channelwise)
+            Y_scale, Y_zero_point, use_bias, use_fused, use_channelwise, reference)
 
     @skipIfNoFBGEMM
     @given(batch_size=st.integers(1, 3),
@@ -509,14 +520,14 @@ class TestStaticQuantizedModule(QuantizationTestCase):
            Y_zero_point=st.integers(0, 4),
            use_bias=st.booleans(),
            use_fused=st.booleans(),
-           use_channelwise=st.booleans())
+           use_channelwise=st.booleans(),
+           reference=st.booleans())
     def test_conv3d_api(
         self, batch_size, in_channels_per_group, D, H, W,
         out_channels_per_group, groups, kernel_d, kernel_h, kernel_w,
         stride_d, stride_h, stride_w, pad_d, pad_h, pad_w, pad_mode, dilation,
         X_scale, X_zero_point, W_scale, W_zero_point, Y_scale, Y_zero_point,
-        use_bias, use_channelwise, use_fused,
-    ):
+            use_bias, use_fused, use_channelwise, reference):
         # Tests the correctness of the conv3d module.
         in_channels = in_channels_per_group * groups
         out_channels = out_channels_per_group * groups
@@ -525,17 +536,21 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         stride = (stride_d, stride_h, stride_w)
         padding = (pad_d, pad_h, pad_w)
         dilation = (dilation, dilation, dilation)
+
+        # (use_fused, reference) -> quantized class
+        class_map = {
+            (True, True): (nniqr.ConvReLU3d, "QuantizedConvReLU3d(Referenc)"),
+            (True, False): (nniq.ConvReLU3d, "QuantizedConvReLU3d"),
+            (False, True): (nnqr.Conv3d, "QuantizedConv3d(Reference)"),
+            (False, False): (nnq.Conv3d, "QuantizedConv3d")
+        }
+
         with override_quantized_engine('fbgemm'):
-            if use_fused:
-                module_name = "QuantizedConvReLU3d"
-                qconv_module = nnq_fused.ConvReLU3d(
-                    in_channels, out_channels, kernel_size, stride, padding,
-                    dilation, groups, use_bias, padding_mode=pad_mode)
-            else:
-                module_name = "QuantizedConv3d"
-                qconv_module = nnq.Conv3d(
-                    in_channels, out_channels, kernel_size, stride, padding,
-                    dilation, groups, use_bias, padding_mode=pad_mode)
+            qconv_cls, module_name = class_map[(use_fused, reference)]
+            qconv_module = qconv_cls(
+                in_channels, out_channels, kernel_size, stride, padding,
+                dilation, groups, use_bias, padding_mode=pad_mode
+            )
 
             conv_module = nn.Conv3d(
                 in_channels, out_channels, kernel_size, stride, padding,
@@ -551,7 +566,7 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                 out_channels_per_group, groups, kernel_size, stride, padding,
                 pad_mode, dilation, X_scale, X_zero_point, W_scale,
                 W_zero_point, Y_scale, Y_zero_point, use_bias, use_fused,
-                use_channelwise)
+                use_channelwise, reference)
 
     def test_pool_api(self):
         """Tests the correctness of the pool module.
