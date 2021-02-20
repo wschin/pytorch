@@ -1,5 +1,6 @@
 #include <torch/csrc/jit/python/script_init.h>
 
+#include <python3.8/descrobject.h>
 #include <torch/csrc/Device.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/frontend/ir_emitter.h>
@@ -17,6 +18,7 @@
 #include <torch/csrc/jit/ir/constants.h>
 #include <torch/csrc/jit/ir/irparser.h>
 #include <torch/csrc/jit/passes/inliner.h>
+#include <torch/csrc/jit/python/module_python.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/jit/python/python_tracer.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
@@ -32,6 +34,7 @@
 #include <ATen/core/function_schema.h>
 #include <ATen/core/qualified_name.h>
 
+#include <Exceptions.h>
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -40,6 +43,7 @@
 #include <cstddef>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -783,7 +787,47 @@ void initJitScriptBindings(PyObject* module) {
                   if (auto method = self.find_method(name)) {
                     return py::cast(*method);
                   }
+                  if (self.has_property(name)) {
+                    auto prop = self.get_property(name);
+                    auto getter_func = py::cast(prop.getter_func);
+                    auto setter_func = py::cast(prop.setter_func);
+                    return getter_func();
+                  }
                   return toPyObject(self.attr(name));
+                } catch (const ObjectAttributeError& err) {
+                  throw AttributeError("%s", err.what());
+                }
+              })
+          .def(
+              "__setattr__",
+              [](Object& self, const std::string& name, py::object value) {
+                try {
+                  if (self.has_property(name)) {
+                    auto prop = self.get_property(name);
+                    auto getter_func = py::cast(prop.getter_func);
+                    if (!prop.setter_func.has_value()) {
+                      TORCH_CHECK(
+                          false,
+                          "Can't set value to '",
+                          name,
+                          "' because setter function is not given.");
+                    }
+                    auto setter_func = py::cast(prop.setter_func);
+                    setter_func(value);
+                    return;
+                  }
+
+                  if (self.type()->hasConstant(name)) {
+                    TORCH_CHECK(
+                        false,
+                        "Can't set constant '",
+                        name,
+                        "' which has value:",
+                        self.type()->getConstant(name));
+                  }
+                  TypePtr type = self.type()->getAttribute(name);
+                  auto ivalue = toIValue(std::move(value), type);
+                  self.setattr(name, ivalue);
                 } catch (const ObjectAttributeError& err) {
                   throw AttributeError("%s", err.what());
                 }
