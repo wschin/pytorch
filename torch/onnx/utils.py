@@ -407,6 +407,11 @@ def _create_jit_graph(model, args, _retain_param_name):
         return graph, params, torch_out, None
     else:
         graph, torch_out = _trace_and_get_graph_from_model(model, args)
+        #print('-------------------')
+        #print(type(graph)) # <class 'torch._C.Graph'>
+        #print(dir(graph)) # inputs, nodes, outputs, ...
+        #print(graph)
+        #print('-------------------')
         state_dict = _unique_state_dict(model)
         params = list(state_dict.values())
         if _retain_param_name:
@@ -416,7 +421,10 @@ def _create_jit_graph(model, args, _retain_param_name):
             for i, inp in enumerate(graph_inputs):
                 if i >= user_input_num:
                     inp.setDebugName(param_names[i - user_input_num])
+        print('--------------------------')
+        print('[utils.py] before _jit_pass_onnx_function_substitution:\n', graph)
         torch._C._jit_pass_onnx_function_substitution(graph)
+        print('[utils.py] after _jit_pass_onnx_function_substitution:\n', graph)
         return graph, params, torch_out, None
 
 

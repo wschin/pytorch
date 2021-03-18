@@ -69,9 +69,22 @@ void validateBlock(
       "\n\nGraph we tried to export:\n" + b->owningGraph()->toString());
     if (node->kind() == prim::PythonOp) {
       auto py_node = static_cast<PythonOp*>(node);
+      std::cout << "-------------------------------" << std::endl;
+      std::cout << "[export.cpp, validateBlock]" << *py_node << std::endl;
+      std::cout << "py_node->name(): " << py_node->name() << std::endl;
+      for (auto& value : py_node->inputs()) {
+        std::cout << "input: " << value->debugName() << ", " << value->type()->annotation_str() << std::endl;
+      }
+      for (auto& value : py_node->outputs()) {
+        std::cout << "output: " << value->debugName() << ", " << value->type()->annotation_str() << std::endl;
+      }
+      std::cout << "-------------------------------" << std::endl;
+      return;
+      /*
       FAIL_EXPORT(
           "Couldn't export Python operator " + py_node->name() +
           "\n\nDefined at:\n" + getNodeStackTraceString(node))
+      */
     } else {
       // Special error messages for certain types of operators
       if (node->kind() == aten::expand) {

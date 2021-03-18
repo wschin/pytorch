@@ -10,8 +10,12 @@ void functionCallSubstitution(Block* block) {
   for (auto it = block->nodes().begin(), end = block->nodes().end();
        it != end;) {
     Node* cur = *it++;
+    std::cout << "------------------------" << std::endl;
+    std::cout << "[function_substitution.cpp, functionCallSubstitution] see " << *cur << std::endl;
+    std::cout << "------------------------" << std::endl;
     switch (cur->kind()) {
       case prim::CallFunction: {
+        std::cout << "[function_substitution.cpp, functionCallSubstitution] cur->kind(): prim::CallFunction" << std::endl;
         AT_ASSERT(cur->input(0)->node()->kind() == prim::Constant);
         auto function_constant = cur->input(0)->node();
         auto fun_type =
@@ -55,6 +59,7 @@ void functionCallSubstitution(Block* block) {
         }
       } break;
       case prim::CallMethod: {
+        std::cout << "[function_substitution.cpp, functionCallSubstitution] cur->kind(): prim::CallMethod" << std::endl;
         const std::string& name = cur->s(attr::name);
         if (auto class_type = cur->input(0)->type()->cast<ClassType>()) {
           Function& function = class_type->getMethod(name);
@@ -66,6 +71,7 @@ void functionCallSubstitution(Block* block) {
         }
       } break;
       default: {
+        std::cout << "[function_substitution.cpp, functionCallSubstitution] cur->kind(): default" << std::endl;
         for (auto b : cur->blocks()) {
           functionCallSubstitution(b);
         }

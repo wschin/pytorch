@@ -168,7 +168,13 @@ std::shared_ptr<Graph> ToONNX(
   ConstantValueMap::ClearMaps();
   auto new_graph = std::make_shared<Graph>(graph->current_scope());
   std::unordered_map<Value*, Value*> env;
+  std::cout << "--------------------------" << std::endl;
+  std::cout << "[onnx.cpp, ToONNX] original graph: " << std::endl << *graph << std::endl;
+  std::cout << "--------------------------" << std::endl;
   BlockToONNX(graph->block(), new_graph->block(), operator_export_type, env);
+  std::cout << "--------------------------" << std::endl;
+  std::cout << "[onnx.cpp, ToONNX] new graph: " << std::endl << *new_graph << std::endl;
+  std::cout << "--------------------------" << std::endl;
   return new_graph;
 }
 
@@ -283,6 +289,17 @@ void NodeToONNX(
     }
   };
 
+  auto clonePythonOp = [&](ConcretePythonOp* node) {
+    auto n_ = new_block->appendNode(
+        new_block->owningGraph()->createClone(node, envFn));
+    for (size_t i = 0; i < node->outputs().size(); i++) {
+      // n_->outputs()[i]->setType(node->outputs()[i]->type());
+      env[node->outputs()[i]] = n_->outputs()[i];
+    }
+    n_->s_(Symbol::attr("name"), node->name());
+    n_->s_(Symbol::attr("function"), node->autogradFunction().value().get()->ob_type->tp_name);
+  };
+
   // Cast output of symbolic() python implementation
   auto processSymbolicOutput = [&](const std::string& op_name,
                                    Node* n,
@@ -338,13 +355,18 @@ void NodeToONNX(
 
   auto callPySymbolicMethod = [&](ConcretePythonOp* op) {
     // Test if there is a symbolic function; bail if there is not
+    bool aaa = false;
+    while(aaa) {
+      aaa = aaa;
+    }
     auto pyobj = py::handle(op->pyobj.get());
     auto func = op->autogradFunction();
     if (func) {
       pyobj = func->get();
     }
     if (!py::hasattr(pyobj, "symbolic")) {
-      cloneNode(op);
+      // cloneNode(op);
+      clonePythonOp(op);
       return;
     }
 
@@ -390,10 +412,13 @@ void NodeToONNX(
   auto k = old_node->kind();
   if (k.is_caffe2()) {
     // Pass on Caffe2 operator, since we already preprocess it
+    std::cout << "[onnx.cpp, BlockToONNX] cloneNode" << std::endl;
     cloneNode(old_node);
   } else if (k == prim::PythonOp) {
+    std::cout << "[onnx.cpp, BlockToONNX] callPySymbolicMethod (prim::PythonOp)" << std::endl;
     callPySymbolicMethod(static_cast<ConcretePythonOp*>(old_node));
   } else {
+    std::cout << "[onnx.cpp, BlockToONNX] callPySymbolicFunction" << std::endl;
     callPySymbolicFunction(old_node);
   }
 }
