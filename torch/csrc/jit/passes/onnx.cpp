@@ -294,10 +294,22 @@ void NodeToONNX(
         new_block->owningGraph()->createClone(node, envFn));
     for (size_t i = 0; i < node->outputs().size(); i++) {
       // n_->outputs()[i]->setType(node->outputs()[i]->type());
-      env[node->outputs()[i]] = n_->outputs()[i];
+      env[node->output(i)] = n_->output(i);
     }
     n_->s_(Symbol::attr("name"), node->name());
-    n_->s_(Symbol::attr("function"), node->autogradFunction().value().get()->ob_type->tp_name);
+
+    // Graph* g = new_block->owningGraph();
+    // Node* python_op = g->create(node->kind(), node->outputs().size());
+    // for (size_t i = 0; i < node->inputs().size(); ++i) {
+    //   python_op->addInput(envFn(node->input(i)));
+    // }
+    // for (size_t i = 0; i < node->outputs().size(); i++) {
+    //   python_op->output(i)->copyMetadata(node->output(i));
+    //   python_op->output(i)->setType(node->output(i)->type());
+    //   env[node->output(i)] = python_op->output(i);
+    // }
+    // python_op->s_(Symbol::attr("name"), node->name());
+    // g->appendNode(python_op);
   };
 
   // Cast output of symbolic() python implementation
