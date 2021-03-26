@@ -7,6 +7,7 @@
 #include <torch/csrc/jit/ir/constants.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
+#include <torch/csrc/jit/passes/onnx/helper.h>
 #include <torch/csrc/jit/passes/onnx/shape_type_inference.h>
 #include <torch/csrc/jit/python/python_ir.h>
 #include <torch/csrc/utils/pybind.h>
@@ -297,6 +298,28 @@ void NodeToONNX(
       env[node->output(i)] = n_->output(i);
     }
     n_->s_(Symbol::attr("name"), node->name());
+
+    std::vector<int64_t> input_types;
+    std::vector<int64_t> input_requires_grads;
+    for (const auto i: n_->inputs()) {
+      const c10::TensorTypePtr& tensor_type = i->type()->cast<TensorType>();
+      const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
+      input_types.push_back(onnx_type);
+      input_requires_grads.push_back(i->requires_grad());
+    }
+
+    std::vector<int64_t> output_types;
+    std::vector<int64_t> output_requires_grads;
+    for (const auto o: n_->outputs()) {
+      const c10::TensorTypePtr& tensor_type = o->type()->cast<TensorType>();
+      const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
+      output_types.push_back(onnx_type);
+      output_requires_grads.push_back(o->requires_grad());
+    }
+    n_->is_(Symbol::attr("input_types"), input_types);
+    n_->is_(Symbol::attr("input_requires_grads"), input_requires_grads);
+    n_->is_(Symbol::attr("output_types"), output_types);
+    n_->is_(Symbol::attr("output_requires_grads"), output_requires_grads);
 
     // Graph* g = new_block->owningGraph();
     // Node* python_op = g->create(node->kind(), node->outputs().size());
