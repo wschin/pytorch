@@ -13,6 +13,7 @@
 #include <torch/csrc/utils/pybind.h>
 #include <sstream>
 #include <unordered_map>
+#include <tuple>
 
 namespace torch {
 namespace jit {
@@ -299,27 +300,230 @@ void NodeToONNX(
     }
     n_->s_(Symbol::attr("name"), node->name());
 
-    std::vector<int64_t> input_types;
-    std::vector<int64_t> input_requires_grads;
-    for (const auto i: n_->inputs()) {
-      const c10::TensorTypePtr& tensor_type = i->type()->cast<TensorType>();
+    //std::cout << "[onnx.cpp,clonePythonOp] cconv: " << node->cconv << std::endl;
+    //std::cout << "[onnx.cpp,clonePythonOp] scalars: " << std::endl;
+    //node->writeScalars(std::cout);
+    //std::cout << std::endl;
+
+    //for (auto& arg : node->scalar_args) {
+    //    auto arg_pyobj = py::handle(arg.get());
+    //  if (py::isinstance<py::int_>(arg_pyobj)) {
+    //    std::cout << "[onnx.cpp,clonePythonOp] scalar_arg int ";
+    //    const int64_t value = py::cast<int64_t>(arg_pyobj);
+    //    std::cout << value << std::endl;
+    //  } else if (py::isinstance<py::float_>(arg_pyobj)) {
+    //    std::cout << "[onnx.cpp,clonePythonOp] scalar_arg float ";
+    //    const double value = py::cast<double>(arg_pyobj);
+    //    std::cout << value << std::endl;
+    //  } else if (py::isinstance<py::tuple>(arg_pyobj)) {
+    //    std::cout << "[onnx.cpp,clonePythonOp] scalar_arg tuple 2222";
+    //    const auto n_elements = (size_t) PyTuple_GET_SIZE(arg.get());
+    //    for (size_t i = 0; i < n_elements; ++i) {
+    //      py::handle h_element = PyTuple_GET_ITEM(arg.get(), i);
+    //      if (py::isinstance<py::int_>(h_element)) {
+    //        const int64_t value = py::cast<int64_t>(h_element);
+    //        std::cout << value << ", ";
+    //      } else if (py::isinstance<py::float_>(h_element)) {
+    //        const int64_t value = py::cast<double>(h_element);
+    //        std::cout << value << ", ";
+    //      }
+    //    }
+    //    //py::tuple arg_tuple = py::reinterpret_borrow<py::tuple>(arg.get);
+    //    //for (auto& element_pyobj : arg_tuple) {
+    //    //  const int64_t value = py::cast<int64_t>(element_pyobj);
+    //    //  std::cout << value << ", ";
+    //    //}
+    //    std::cout << std::endl;
+    //  }
+    //}
+
+    //std::vector<int64_t> input_types;
+    //std::vector<int64_t> input_requires_grads;
+    //for (const auto i: n_->inputs()) {
+    //  const c10::TensorTypePtr& tensor_type = i->type()->cast<TensorType>();
+    //  const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
+    //  input_types.push_back(onnx_type);
+    //  input_requires_grads.push_back(i->requires_grad());
+    //}
+
+    //std::vector<int64_t> output_types;
+    //std::vector<int64_t> output_requires_grads;
+    //for (const auto o: n_->outputs()) {
+    //  const c10::TensorTypePtr& tensor_type = o->type()->cast<TensorType>();
+    //  const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
+    //  output_types.push_back(onnx_type);
+    //  output_requires_grads.push_back(o->requires_grad());
+    //}
+
+    // Attributes for tensor inputs.
+    std::vector<int64_t> input_tensor_types;
+    std::vector<int64_t> input_tensor_requires_grads;
+
+    // Attributes for Python's int inputs. Its value can be arbitrarily large, but
+    // we assume it can be stored as int64_t in C++.
+    std::vector<int64_t> input_int_scalars;
+    // input_int64_scalar_positions[i] is the position index of input_int64_scalars[i]
+    // when calling the original autograd.Function.apply.
+    std::vector<int64_t> input_int_scalar_positions;
+
+    // Attributes for Python's double inputs.
+    std::vector<double> input_float_scalars;
+    std::vector<int64_t> input_float_scalar_positions;
+
+    std::vector<int64_t> input_int_tuples;
+    std::vector<int64_t> input_int_tuple_positions;
+    std::vector<int64_t> input_int_tuple_begins;
+
+    std::vector<double> input_float_tuples;
+    std::vector<int64_t> input_float_tuple_positions;
+    std::vector<int64_t> input_float_tuple_begins;
+
+    // "apply_index=i" means the i-th input argument of apply(...).
+    // "scalar_index" is position index to scalar arguments of apply(...).
+    // For example, "index=0" means the 1st scalar argument.
+    // Note that tensors are not indexed by this "scalar_index".
+    auto process_scalar = [&] (const size_t apply_index, const size_t scalar_index) {
+      auto& arg = node->scalar_args.at(scalar_index);
+      auto arg_raw = arg.get();
+      auto arg_handle = py::handle(arg.get());
+
+      // Store attributes of this scalar.
+      if (py::isinstance<py::int_>(arg_handle)) {
+        // Case 1: See a Python int.
+        input_int_scalar_positions.push_back(apply_index);
+        const int64_t value = py::cast<int64_t>(arg_handle);
+        input_int_scalars.push_back(value);
+      } else if (py::isinstance<py::float_>(arg_handle)) {
+        // Case 2: See a Python float.
+        input_float_scalar_positions.push_back(apply_index);
+        const double value = py::cast<double>(arg_handle);
+        input_float_scalars.push_back(value);
+      } else if (py::isinstance<py::tuple>(arg_handle)) {
+        // Case 3: See a Python tuple.
+        // Set tuple-wise attributes.
+        py::handle item = PyTuple_GET_ITEM(arg_raw, 0);
+        if (py::isinstance<py::int_>(item)) {
+          input_int_tuple_positions.push_back(apply_index);
+          input_int_tuple_begins.push_back(input_int_tuples.size());
+        } else if (py::isinstance<py::float_>(item)) {
+          input_float_tuple_positions.push_back(apply_index);
+          input_float_tuple_begins.push_back(input_float_tuples.size());
+        } else {
+          std::ostringstream ss;
+          ss << "Error casting " << 0 << "th input element in Python tuple. "
+              << "Only float and int are supported." ;
+          throw std::runtime_error(ss.str());
+        }
+
+        // Store tuple elements.
+        // All same-type tuples' elements are stored in a flattened list.
+        // Get the length of this tuple.
+        const auto n_elements = static_cast<size_t>(PyTuple_GET_SIZE(arg_raw));
+        for (size_t i = 0; i < n_elements; ++i) {
+          py::handle item = PyTuple_GET_ITEM(arg_raw, i);
+          if (py::isinstance<py::int_>(item)) {
+            const int64_t value = py::cast<int64_t>(item);
+            input_int_tuples.push_back(value);
+          } else if (py::isinstance<py::float_>(item)) {
+            const double value = py::cast<double>(item);
+            input_float_tuples.push_back(value);
+          } else {
+            std::ostringstream ss;
+            ss << "Error casting " << i << "th input element in Python tuple. "
+               << "That tuple is the "
+               << apply_index
+               << "th input argument of Python function. "
+               << "Only float and int are supported. ";
+            py::print(arg_handle);
+            py::print(item);
+            throw std::runtime_error(ss.str());
+          }
+        }
+      } else {
+        std::ostringstream ss;
+        ss << "Error casting " << apply_index << "th input argument of Python function. "
+           << "Only float, int, and tensor are supported." ;
+        throw std::runtime_error(ss.str());
+      }
+    };
+
+    // "apply_index=i" means the i-th input argument of apply(...).
+    // "tensor_index" is position index to tensor arguments of apply(...).
+    // For example, "index=0" means the 1st tensor argument.
+    // Note that scalars are not indexed by this "tensor_index".
+    auto process_tensor = [&] (const size_t apply_index, const size_t tensor_index) {
+      const auto tensor = n_->inputs().at(tensor_index);
+      const c10::TensorTypePtr& tensor_type = tensor->type()->cast<TensorType>();
       const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
-      input_types.push_back(onnx_type);
-      input_requires_grads.push_back(i->requires_grad());
+      // Store attributes of this tensor.
+      input_tensor_types.push_back(onnx_type);
+      input_tensor_requires_grads.push_back(tensor->requires_grad());
+    };
+
+    // Encode inputs of PythonOp.
+    size_t visited_tensor_count = 0;
+    size_t visited_scalar_count = 0;
+    for (size_t i = 0; i < node->cconv.size(); ++i) {
+      char arg_type =  node->cconv.at(i);
+      if (arg_type == 'c') {
+        // Process visited_scalar_count-th scalar input which is from
+        // the i-th input argument of apply(...).
+        // This will be a part of attributes in ONNX PythonOp.
+        process_scalar(i, visited_scalar_count++);
+      } else if (arg_type == 'd') {
+        // Process visited_tensor_count-th tensor input which is from
+        // the i-th input argument of apply(...).
+        // This will be an input to ONNX PythonOp.
+        process_tensor(i, visited_tensor_count++);
+      } else {
+        std::ostringstream ss;
+        ss << "Error type " << arg_type << ". Only \'c\' and \'d\' are allowed. ";
+        throw std::runtime_error(ss.str());
+      }
     }
 
-    std::vector<int64_t> output_types;
-    std::vector<int64_t> output_requires_grads;
-    for (const auto o: n_->outputs()) {
+    // Encode outputs of PythonOp. They are assumed to be tensors.
+    std::vector<int64_t> output_tensor_types;
+    std::vector<int64_t> output_tensor_requires_grads;
+    for (const auto o: node->outputs()) {
       const c10::TensorTypePtr& tensor_type = o->type()->cast<TensorType>();
       const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
-      output_types.push_back(onnx_type);
-      output_requires_grads.push_back(o->requires_grad());
+      output_tensor_types.push_back(onnx_type);
+      output_tensor_requires_grads.push_back(o->requires_grad());
     }
-    n_->is_(Symbol::attr("input_types"), input_types);
-    n_->is_(Symbol::attr("input_requires_grads"), input_requires_grads);
-    n_->is_(Symbol::attr("output_types"), output_types);
-    n_->is_(Symbol::attr("output_requires_grads"), output_requires_grads);
+
+    // The string which specifies input arguments of 
+    n_->s_(Symbol::attr("call_convention"), node->cconv);
+    n_->is_(Symbol::attr("input_tensor_types"), input_tensor_types);
+    n_->is_(Symbol::attr("input_tensor_requires_grads"), input_tensor_requires_grads);
+    n_->is_(Symbol::attr("output_tensor_types"), output_tensor_types);
+    n_->is_(Symbol::attr("output_tensor_requires_grads"), output_tensor_requires_grads);
+
+    // Input int scalars.
+    if (input_int_scalars.size()) {
+      n_->is_(Symbol::attr("input_int_scalars"), input_int_scalars);
+      n_->is_(Symbol::attr("input_int_scalar_positions"), input_int_scalar_positions);
+    }
+
+    // Input float scalars.
+    if (input_float_scalars.size()) {
+      n_->fs_(Symbol::attr("input_float_scalars"), input_float_scalars);
+      n_->is_(Symbol::attr("input_float_scalar_positions"), input_float_scalar_positions);
+    }
+
+    // Input int tuple.
+    if (input_int_tuples.size()) {
+      n_->is_(Symbol::attr("input_int_tuples"), input_int_tuples);
+      n_->is_(Symbol::attr("input_int_tuple_positions"), input_int_tuple_positions);
+      n_->is_(Symbol::attr("input_int_tuple_begins"), input_int_tuple_begins);
+    }
+
+    // Input double tuple.
+    if (input_float_tuples.size()) {
+      n_->fs_(Symbol::attr("input_float_tuples"), input_float_tuples);
+      n_->is_(Symbol::attr("input_float_tuple_positions"), input_float_tuple_positions);
+      n_->is_(Symbol::attr("input_float_tuple_begins"), input_float_tuple_begins);
+    }
 
     // Graph* g = new_block->owningGraph();
     // Node* python_op = g->create(node->kind(), node->outputs().size());
