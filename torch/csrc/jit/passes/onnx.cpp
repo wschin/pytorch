@@ -170,13 +170,7 @@ std::shared_ptr<Graph> ToONNX(
   ConstantValueMap::ClearMaps();
   auto new_graph = std::make_shared<Graph>(graph->current_scope());
   std::unordered_map<Value*, Value*> env;
-  std::cout << "--------------------------" << std::endl;
-  std::cout << "[onnx.cpp, ToONNX] original graph: " << std::endl << *graph << std::endl;
-  std::cout << "--------------------------" << std::endl;
   BlockToONNX(graph->block(), new_graph->block(), operator_export_type, env);
-  std::cout << "--------------------------" << std::endl;
-  std::cout << "[onnx.cpp, ToONNX] new graph: " << std::endl << *new_graph << std::endl;
-  std::cout << "--------------------------" << std::endl;
   return new_graph;
 }
 
@@ -300,61 +294,6 @@ void NodeToONNX(
     }
     n_->s_(Symbol::attr("name"), node->name());
 
-    //std::cout << "[onnx.cpp,clonePythonOp] cconv: " << node->cconv << std::endl;
-    //std::cout << "[onnx.cpp,clonePythonOp] scalars: " << std::endl;
-    //node->writeScalars(std::cout);
-    //std::cout << std::endl;
-
-    //for (auto& arg : node->scalar_args) {
-    //    auto arg_pyobj = py::handle(arg.get());
-    //  if (py::isinstance<py::int_>(arg_pyobj)) {
-    //    std::cout << "[onnx.cpp,clonePythonOp] scalar_arg int ";
-    //    const int64_t value = py::cast<int64_t>(arg_pyobj);
-    //    std::cout << value << std::endl;
-    //  } else if (py::isinstance<py::float_>(arg_pyobj)) {
-    //    std::cout << "[onnx.cpp,clonePythonOp] scalar_arg float ";
-    //    const double value = py::cast<double>(arg_pyobj);
-    //    std::cout << value << std::endl;
-    //  } else if (py::isinstance<py::tuple>(arg_pyobj)) {
-    //    std::cout << "[onnx.cpp,clonePythonOp] scalar_arg tuple 2222";
-    //    const auto n_elements = (size_t) PyTuple_GET_SIZE(arg.get());
-    //    for (size_t i = 0; i < n_elements; ++i) {
-    //      py::handle h_element = PyTuple_GET_ITEM(arg.get(), i);
-    //      if (py::isinstance<py::int_>(h_element)) {
-    //        const int64_t value = py::cast<int64_t>(h_element);
-    //        std::cout << value << ", ";
-    //      } else if (py::isinstance<py::float_>(h_element)) {
-    //        const int64_t value = py::cast<double>(h_element);
-    //        std::cout << value << ", ";
-    //      }
-    //    }
-    //    //py::tuple arg_tuple = py::reinterpret_borrow<py::tuple>(arg.get);
-    //    //for (auto& element_pyobj : arg_tuple) {
-    //    //  const int64_t value = py::cast<int64_t>(element_pyobj);
-    //    //  std::cout << value << ", ";
-    //    //}
-    //    std::cout << std::endl;
-    //  }
-    //}
-
-    //std::vector<int64_t> input_types;
-    //std::vector<int64_t> input_requires_grads;
-    //for (const auto i: n_->inputs()) {
-    //  const c10::TensorTypePtr& tensor_type = i->type()->cast<TensorType>();
-    //  const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
-    //  input_types.push_back(onnx_type);
-    //  input_requires_grads.push_back(i->requires_grad());
-    //}
-
-    //std::vector<int64_t> output_types;
-    //std::vector<int64_t> output_requires_grads;
-    //for (const auto o: n_->outputs()) {
-    //  const c10::TensorTypePtr& tensor_type = o->type()->cast<TensorType>();
-    //  const int64_t onnx_type = ATenTypeToOnnxType(tensor_type->scalarType().value());
-    //  output_types.push_back(onnx_type);
-    //  output_requires_grads.push_back(o->requires_grad());
-    //}
-
     // Attributes for tensor inputs.
     std::vector<int64_t> input_tensor_types;
     std::vector<int64_t> input_tensor_requires_grads;
@@ -378,6 +317,9 @@ void NodeToONNX(
     std::vector<int64_t> input_float_tuple_positions;
     std::vector<int64_t> input_float_tuple_begins;
 
+    std::vector<int64_t> input_pointer_scalars; 
+    std::vector<int64_t> input_pointer_scalar_positions;
+
     // "apply_index=i" means the i-th input argument of apply(...).
     // "scalar_index" is position index to scalar arguments of apply(...).
     // For example, "index=0" means the 1st scalar argument.
@@ -386,6 +328,9 @@ void NodeToONNX(
       auto& arg = node->scalar_args.at(scalar_index);
       auto arg_raw = arg.get();
       auto arg_handle = py::handle(arg.get());
+
+      std::cout << "[onnx.cc,process_scalar] Process " << std::endl;
+      py::print(arg_handle);
 
       // Store attributes of this scalar.
       if (py::isinstance<py::int_>(arg_handle)) {
@@ -410,8 +355,9 @@ void NodeToONNX(
           input_float_tuple_begins.push_back(input_float_tuples.size());
         } else {
           std::ostringstream ss;
-          ss << "Error casting " << 0 << "th input element in Python tuple. "
-              << "Only float and int are supported." ;
+          ss << "Error casting " << 0 << "th input element in Python tuple "
+             << "when processing node " << node->name() << ". "
+             << "Only float and int are supported." ;
           throw std::runtime_error(ss.str());
         }
 
@@ -429,7 +375,8 @@ void NodeToONNX(
             input_float_tuples.push_back(value);
           } else {
             std::ostringstream ss;
-            ss << "Error casting " << i << "th input element in Python tuple. "
+            ss << "Error casting " << i << "th input element in Python tuple "
+               << "when processing node " << node->name() << ". "
                << "That tuple is the "
                << apply_index
                << "th input argument of Python function. "
@@ -440,10 +387,14 @@ void NodeToONNX(
           }
         }
       } else {
-        std::ostringstream ss;
-        ss << "Error casting " << apply_index << "th input argument of Python function. "
-           << "Only float, int, and tensor are supported." ;
-        throw std::runtime_error(ss.str());
+        input_pointer_scalar_positions.push_back(apply_index);
+        input_pointer_scalars.push_back((int64_t)arg_raw);
+        //std::ostringstream ss;
+        //ss << "Error casting " << apply_index << "th input argument of Python function "
+        //   << "when processing node " << node->name() << ". "
+        //   << "Only float, int, and tuple are supported." ;
+        //py::print(arg_handle);
+        //throw std::runtime_error(ss.str());
       }
     };
 
@@ -525,18 +476,10 @@ void NodeToONNX(
       n_->is_(Symbol::attr("input_float_tuple_begins"), input_float_tuple_begins);
     }
 
-    // Graph* g = new_block->owningGraph();
-    // Node* python_op = g->create(node->kind(), node->outputs().size());
-    // for (size_t i = 0; i < node->inputs().size(); ++i) {
-    //   python_op->addInput(envFn(node->input(i)));
-    // }
-    // for (size_t i = 0; i < node->outputs().size(); i++) {
-    //   python_op->output(i)->copyMetadata(node->output(i));
-    //   python_op->output(i)->setType(node->output(i)->type());
-    //   env[node->output(i)] = python_op->output(i);
-    // }
-    // python_op->s_(Symbol::attr("name"), node->name());
-    // g->appendNode(python_op);
+    if(input_pointer_scalars.size()) {
+      n_->is_(Symbol::attr("input_pointer_scalars"), input_pointer_scalars);
+      n_->is_(Symbol::attr("input_pointer_scalar_positions"), input_pointer_scalar_positions);
+    }
   };
 
   // Cast output of symbolic() python implementation
