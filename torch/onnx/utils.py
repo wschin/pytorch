@@ -421,10 +421,10 @@ def _create_jit_graph(model, args, _retain_param_name):
             for i, inp in enumerate(graph_inputs):
                 if i >= user_input_num:
                     inp.setDebugName(param_names[i - user_input_num])
-        print('--------------------------')
-        print('[utils.py] before _jit_pass_onnx_function_substitution:\n', graph)
+        #print('--------------------------')
+        #print('[utils.py] before _jit_pass_onnx_function_substitution:\n', graph)
         torch._C._jit_pass_onnx_function_substitution(graph)
-        print('[utils.py] after _jit_pass_onnx_function_substitution:\n', graph)
+        #print('[utils.py] after _jit_pass_onnx_function_substitution:\n', graph)
         return graph, params, torch_out, None
 
 

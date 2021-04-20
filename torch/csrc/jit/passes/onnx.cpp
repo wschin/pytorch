@@ -286,6 +286,7 @@ void NodeToONNX(
   };
 
   auto clonePythonOp = [&](ConcretePythonOp* node) {
+    std::cout << "[onnx.cpp] Python node: " << *node << std::endl;
     auto n_ = new_block->appendNode(
         new_block->owningGraph()->createClone(node, envFn));
     for (size_t i = 0; i < node->outputs().size(); i++) {
@@ -388,6 +389,12 @@ void NodeToONNX(
         }
       } else {
         input_pointer_scalar_positions.push_back(apply_index);
+        std::cout << "[onnx.cpp] raw obj: " << std::endl;
+        PyObject_Print(arg_raw, stdout, 0);
+        Py_INCREF(arg_raw);
+        Py_INCREF(arg_raw);
+        Py_INCREF(arg_raw);
+        std::cout << std::endl;
         input_pointer_scalars.push_back((int64_t)arg_raw);
         //std::ostringstream ss;
         //ss << "Error casting " << apply_index << "th input argument of Python function "
@@ -433,6 +440,10 @@ void NodeToONNX(
       }
     }
 
+    std::cout << "[onnx.cpp] Python node " << node->name() << " has "
+              << node->inputs().size() << " inputs, "
+              << node->outputs().size() << " outputs, "
+              << node->cconv << " cconv." << std::endl;
     // Encode outputs of PythonOp. They are assumed to be tensors.
     std::vector<int64_t> output_tensor_types;
     std::vector<int64_t> output_tensor_requires_grads;
@@ -594,13 +605,10 @@ void NodeToONNX(
   auto k = old_node->kind();
   if (k.is_caffe2()) {
     // Pass on Caffe2 operator, since we already preprocess it
-    std::cout << "[onnx.cpp, BlockToONNX] cloneNode" << std::endl;
     cloneNode(old_node);
   } else if (k == prim::PythonOp) {
-    std::cout << "[onnx.cpp, BlockToONNX] callPySymbolicMethod (prim::PythonOp)" << std::endl;
     callPySymbolicMethod(static_cast<ConcretePythonOp*>(old_node));
   } else {
-    std::cout << "[onnx.cpp, BlockToONNX] callPySymbolicFunction" << std::endl;
     callPySymbolicFunction(old_node);
   }
 }
