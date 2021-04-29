@@ -334,6 +334,8 @@ void NodeToONNX(
       py::print(arg_handle);
 
       // Store attributes of this scalar.
+
+      input_tensor_requires_grads.push_back(0);
       if (py::isinstance<py::int_>(arg_handle)) {
         // Case 1: See a Python int.
         input_int_scalar_positions.push_back(apply_index);
