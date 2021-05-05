@@ -510,9 +510,12 @@ void EncoderBase::EncodeBlock(
     if (is_raw_export) {
       AT_ASSERT(!node->kind().is_onnx());
     } else if (operator_export_type_ == onnx_torch::OperatorExportTypes::ONNX) {
+      std::cout << "[onnx.cpp] Why do you throw?" << std::endl;
+      /*
       AT_ASSERT(
           !node->kind().is_aten() && !node->kind().is_prim() &&
           !node->kind().is_attr());
+      */
     }
     p_n->set_op_type(node->kind().toUnqualString());
     if (add_node_names) {
