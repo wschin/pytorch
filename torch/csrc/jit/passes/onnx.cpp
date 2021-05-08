@@ -287,6 +287,8 @@ void NodeToONNX(
 
   auto clonePythonOp = [&](ConcretePythonOp* node) {
     std::cout << "[onnx.cpp] Python node: " << *node << std::endl;
+    py::object _training_mode = onnx_symbolic.attr("_training_mode");
+    int64_t training_mode = _training_mode.cast<int64_t>();
     auto n_ = new_block->appendNode(
         new_block->owningGraph()->createClone(node, envFn));
     for (size_t i = 0; i < node->outputs().size(); i++) {
@@ -294,6 +296,7 @@ void NodeToONNX(
       env[node->output(i)] = n_->output(i);
     }
     n_->s_(Symbol::attr("name"), node->name());
+    n_->i_(Symbol::attr("training_mode"), training_mode);
 
     // Attributes for tensor inputs.
     std::vector<int64_t> input_tensor_types;
