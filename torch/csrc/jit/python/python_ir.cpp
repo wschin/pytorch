@@ -39,6 +39,16 @@ std::string getPythonName(const PyObject* obj_) {
   return py::str(v);
 }
 
+std::string getFullPythonName(const PyObject* obj_) {
+  pybind11::gil_scoped_acquire gil;
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+  PyObject* obj = const_cast<PyObject*>(obj_);
+  auto v = py::getattr(obj, "__qualname__", py::str("<python_value>")).cast<std::string>();
+  auto w = py::getattr(obj, "__module__", py::str("<python_value>")).cast<std::string>();
+  // if this was a autograd.Function recover the name of the class
+  return w + std::string(".") + v;
+}
+
 std::ostream& printPyObject(std::ostream& out, const THPObjectPtr& obj) {
   pybind11::gil_scoped_acquire gil;
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
@@ -137,6 +147,15 @@ std::string ConcretePythonOp::name() const {
     return getPythonName(autograd->get());
   } else {
     return getPythonName(pyobj.get());
+  }
+}
+
+std::string ConcretePythonOp::fullName() const {
+  pybind11::gil_scoped_acquire gil;
+  if (auto autograd = autogradFunction()) {
+    return getFullPythonName(autograd->get());
+  } else {
+    return getFullPythonName(pyobj.get());
   }
 }
 

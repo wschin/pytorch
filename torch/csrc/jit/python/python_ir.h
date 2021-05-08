@@ -37,6 +37,7 @@ struct ConcretePythonOp : public PythonOp {
   std::vector<THPObjectPtr> scalar_args;
 
   std::string name() const override;
+  std::string fullName() const;
   void cloneFrom(Node* other_) override;
   Node* allocNewInstance(Graph* g) override {
     return new ConcretePythonOp(g);

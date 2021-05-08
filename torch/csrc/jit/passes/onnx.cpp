@@ -295,7 +295,8 @@ void NodeToONNX(
       // n_->outputs()[i]->setType(node->outputs()[i]->type());
       env[node->output(i)] = n_->output(i);
     }
-    n_->s_(Symbol::attr("name"), node->name());
+    // n_->s_(Symbol::attr("name"), node->name());
+    n_->s_(Symbol::attr("name"), node->fullName());
     n_->i_(Symbol::attr("training_mode"), training_mode);
 
     // Attributes for tensor inputs.
