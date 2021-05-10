@@ -562,6 +562,7 @@ static void _trace_post_record(
   variable_list output_vars(num_outputs);
   auto graph = node->owningGraph();
   node->addOutput();
+  auto old_node = node;
   if (!unpack_output) {
     std::vector<TypePtr> tuple_values(num_outputs, TensorType::get());
     TypePtr tuple_type = TupleType::create(std::move(tuple_values));
@@ -569,6 +570,7 @@ static void _trace_post_record(
     auto unpacked = graph->createTupleUnpack(node->output())->insertAfter(node);
     node = unpacked;
   }
+
   for (int i = 0; i < num_outputs; ++i) {
     PyObject* obj = PyTuple_GET_ITEM(output_objects, i);
     if (THPVariable_Check(obj)) {
@@ -579,6 +581,16 @@ static void _trace_post_record(
         jit::tracer::setValueTrace(tensor, value);
       }
     }
+  }
+
+  if (!unpack_output) {
+    std::vector<TypePtr> new_tuple_values;
+    for (int i = 0; i < num_outputs; ++i) {
+      TypePtr ptr = node->outputs()[i]->type();
+      new_tuple_values.push_back(ptr);
+    }
+    TypePtr tuple_type = TupleType::create(std::move(new_tuple_values));
+    old_node->output()->setType(tuple_type);
   }
 }
 

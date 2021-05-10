@@ -286,7 +286,6 @@ void NodeToONNX(
   };
 
   auto clonePythonOp = [&](ConcretePythonOp* node) {
-    std::cout << "[onnx.cpp] Python node: " << *node << std::endl;
     py::object _training_mode = onnx_symbolic.attr("_training_mode");
     int64_t training_mode = _training_mode.cast<int64_t>();
     auto n_ = new_block->appendNode(
@@ -333,9 +332,6 @@ void NodeToONNX(
       auto& arg = node->scalar_args.at(scalar_index);
       auto arg_raw = arg.get();
       auto arg_handle = py::handle(arg.get());
-
-      std::cout << "[onnx.cc,process_scalar] Process " << std::endl;
-      py::print(arg_handle);
 
       // Store attributes of this scalar.
 
@@ -395,12 +391,10 @@ void NodeToONNX(
         }
       } else {
         input_pointer_scalar_positions.push_back(apply_index);
-        std::cout << "[onnx.cpp] raw obj: " << std::endl;
         PyObject_Print(arg_raw, stdout, 0);
         Py_INCREF(arg_raw);
         Py_INCREF(arg_raw);
         Py_INCREF(arg_raw);
-        std::cout << std::endl;
         input_pointer_scalars.push_back((int64_t)arg_raw);
         //std::ostringstream ss;
         //ss << "Error casting " << apply_index << "th input argument of Python function "
@@ -446,10 +440,6 @@ void NodeToONNX(
       }
     }
 
-    std::cout << "[onnx.cpp] Python node " << node->name() << " has "
-              << node->inputs().size() << " inputs, "
-              << node->outputs().size() << " outputs, "
-              << node->cconv << " cconv." << std::endl;
     // Encode outputs of PythonOp. They are assumed to be tensors.
     std::vector<int64_t> output_tensor_types;
     std::vector<int64_t> output_tensor_requires_grads;
@@ -564,7 +554,7 @@ void NodeToONNX(
       pyobj = func->get();
     }
     if (!py::hasattr(pyobj, "symbolic")) {
-      // cloneNode(op);
+      //cloneNode(op);
       clonePythonOp(op);
       return;
     }
