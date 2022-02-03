@@ -1,7 +1,14 @@
+#include <torch/csrc/lazy/ts_backend/ts_node_lowering.h>
+
+#include <ATen/Functions.h>
 #include <torch/csrc/jit/frontend/sugared_value.h>
 #include <torch/csrc/lazy/backend/backend_interface.h>
 #include <torch/csrc/lazy/core/helpers.h>
+#include <torch/csrc/lazy/ts_backend/ops/cast.h>
+#include <torch/csrc/lazy/ts_backend/ops/device_data.h>
+#include <torch/csrc/lazy/ts_backend/ops/expand.h>
 #include <torch/csrc/lazy/core/internal_ops/ltc_ops.h>
+#include <torch/csrc/lazy/ts_backend/ops/scalar.h>
 #include <torch/csrc/lazy/core/permutation_util.h>
 #include <torch/csrc/lazy/core/view_ops/as_strided.h>
 #include <torch/csrc/lazy/core/view_ops/as_strided_view_update.h>
@@ -12,16 +19,8 @@
 #include <torch/csrc/lazy/core/view_ops/select_view_update.h>
 #include <torch/csrc/lazy/core/view_ops/view.h>
 #include <torch/csrc/lazy/ts_backend/ts_lowering_context.h>
-#include <torch/csrc/lazy/ts_backend/ts_node_lowering.h>
 
-#include "lazy_tensor_core/csrc/ops/cast.h"
-#include "lazy_tensor_core/csrc/ops/constant_pad_nd.h"
-#include "lazy_tensor_core/csrc/ops/convolution_backward_overrideable.h"
-#include "lazy_tensor_core/csrc/ops/convolution_overrideable.h"
-#include "lazy_tensor_core/csrc/ops/device_data.h"
-#include "lazy_tensor_core/csrc/ops/expand.h"
 #include "lazy_tensor_core/csrc/ops/repeat.h"
-#include "lazy_tensor_core/csrc/ops/scalar.h"
 #include "lazy_tensor_core/csrc/ops/squeeze.h"
 #include "lazy_tensor_core/csrc/ops/stack.h"
 #include "lazy_tensor_core/csrc/ops/ts_native_batch_norm_backward.h"
@@ -78,7 +77,7 @@ class TSNodeLowering : public TSNodeLoweringInterface {
               node, *torch::lazy::ltc_as_strided_view_update));
     }
     if (node->op() == *torch::lazy::ltc_cast) {
-      return LowerCast(torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::Cast>(
+      return LowerCast(torch::lazy::NodeCast<torch::lazy::Cast>(
           node, *torch::lazy::ltc_cast));
     }
     if (node->op() == *torch::lazy::ltc_select_view_update) {
@@ -92,26 +91,13 @@ class TSNodeLowering : public TSNodeLoweringInterface {
               node, *torch::lazy::ltc_narrow_view_update));
     }
     if (node->op().op == at::prim::Constant) {
-      return LowerScalar(torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::Scalar>(
+      return LowerScalar(torch::lazy::NodeCast<torch::lazy::Scalar>(
           node, torch::lazy::OpKind(at::prim::Constant)));
     }
     if (node->op().op == at::aten::bernoulli) {
       std::vector<torch::jit::NamedValue> arguments;
       arguments.emplace_back(loctx()->GetOutputOp(node->operand(0)));
       return LowerBuiltin(node, arguments);
-    }
-    if (node->op().op == at::aten::convolution_backward_overrideable) {
-      return LowerConvolutionBackwardOverrideable(
-          torch::lazy::NodeCast<
-              torch_lazy_tensors::ir::ops::ConvolutionBackwardOverrideable>(
-              node, torch::lazy::OpKind(
-                        at::aten::convolution_backward_overrideable)));
-    }
-    if (node->op().op == at::aten::convolution_overrideable) {
-      return LowerConvolutionOverrideable(
-          torch::lazy::NodeCast<
-              torch_lazy_tensors::ir::ops::ConvolutionOverrideable>(
-              node, torch::lazy::OpKind(at::aten::convolution_overrideable)));
     }
     if (node->op().op == at::aten::native_batch_norm) {
       return LowerBatchNorm(
@@ -125,14 +111,9 @@ class TSNodeLowering : public TSNodeLoweringInterface {
               torch_lazy_tensors::ir::ops::TSNativeBatchNormBackward>(
               node, torch::lazy::OpKind(at::aten::native_batch_norm_backward)));
     }
-    if (node->op().op == at::aten::constant_pad_nd) {
-      return LowerConstantPad(
-          torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::ConstantPadNd>(
-              node, torch::lazy::OpKind(at::aten::constant_pad_nd)));
-    }
     if (node->op().op == at::aten::expand) {
       return LowerExpand(
-          torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::Expand>(
+          torch::lazy::NodeCast<torch::lazy::Expand>(
               node, torch::lazy::OpKind(at::aten::expand)));
     }
     if (node->op().op == at::aten::narrow) {
@@ -172,8 +153,8 @@ class TSNodeLowering : public TSNodeLoweringInterface {
           node, torch::lazy::OpKind(at::aten::view)));
     }
     if (node->op() == *torch::lazy::ltc_device_data) {
-      const torch_lazy_tensors::ir::ops::DeviceData* device_data_node =
-          torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::DeviceData>(
+      const torch::lazy::DeviceData* device_data_node =
+          torch::lazy::NodeCast<torch::lazy::DeviceData>(
               node, *torch::lazy::ltc_device_data);
       return {loctx()->GetParameter(device_data_node->data())};
     }
@@ -262,111 +243,14 @@ class TSNodeLowering : public TSNodeLoweringInterface {
     return LowerBuiltin(node, arguments);
   }
 
-  TSOpVector LowerCast(const torch_lazy_tensors::ir::ops::Cast* node) {
+  TSOpVector LowerCast(const torch::lazy::Cast* node) {
     std::vector<torch::jit::NamedValue> arguments;
     arguments.emplace_back(loctx()->GetOutputOp(node->operand(0)));
     arguments.emplace_back(node->dtype());
     return LowerBuiltin(at::aten::to, arguments);
   }
 
-  TSOpVector LowerConvolutionBackwardOverrideable(
-      const torch_lazy_tensors::ir::ops::ConvolutionBackwardOverrideable*
-          conv) {
-    const auto& operands = conv->operands();
-    CHECK(!operands.empty());
-
-    std::vector<torch::jit::NamedValue> arguments;
-
-    // TODO: Clean up after convolution unification is done.
-    auto& ctx = at::globalContext();
-    CHECK(ctx.userEnabledCuDNN() &&
-          torch::lazy::getBackend()->EagerFallbackDeviceType() == at::kCUDA);
-
-    // See cudnn_convolution_backward/cudnn_convolution_transpose_backward in
-    // native_functions.yaml
-    arguments.emplace_back(loctx()->GetOutputOp(operands[1]));
-    arguments.emplace_back(loctx()->GetOutputOp(operands[0]));
-    arguments.emplace_back(loctx()->GetOutputOp(operands[2]));
-
-    arguments.emplace_back(conv->padding());
-    if (conv->transposed()) {
-      arguments.emplace_back(conv->output_padding());
-    }
-    arguments.emplace_back(conv->stride());
-    arguments.emplace_back(conv->dilation());
-    arguments.emplace_back(conv->groups());
-    arguments.emplace_back(ctx.benchmarkCuDNN());  // benchmark
-    arguments.emplace_back(ctx.deterministicCuDNN() ||
-                           ctx.deterministicAlgorithms());  // deterministic
-    arguments.emplace_back(ctx.allowTF32CuDNN());           // allow_tf3
-    std::array<bool, 2> output_mask = {conv->output_mask()[0],
-                                       conv->output_mask()[1]};
-    arguments.emplace_back(output_mask);
-
-    auto result =
-        conv->transposed()
-            ? LowerBuiltin(at::aten::cudnn_convolution_transpose_backward,
-                           arguments)
-            : LowerBuiltin(at::aten::cudnn_convolution_backward, arguments);
-
-    // N.B. rank is specialized even with dynamic shapes
-    // all axes but channel to reduce to the bias size
-    auto grad_rank = dynamic_cast<const torch::lazy::TsNode*>(operands[0].node)->shape(operands[0].index).dim();
-    std::vector<int64_t> axes(grad_rank);
-    std::iota(axes.begin(), axes.end(), 0);
-    TORCH_INTERNAL_ASSERT(grad_rank >= 3, "Convolution outputs should have 3+ dimensions");
-    axes.erase(axes.begin() + 1);
-    auto axes_val = loctx()->graph()->insertConstant(axes);
-    auto bias_grad = loctx()->graph()->insert(at::aten::sum, {loctx()->GetOutputOp(operands[0]), axes_val});
-    result.push_back(bias_grad);
-    return result;
-  }
-
-  TSOpVector LowerConvolutionOverrideable(
-      const torch_lazy_tensors::ir::ops::ConvolutionOverrideable* conv) {
-    constexpr size_t kBiasOperandsOffset = 2;
-    const auto& operands = conv->operands();
-    CHECK(!operands.empty());
-
-    std::vector<torch::jit::NamedValue> arguments;
-    arguments.emplace_back(loctx()->GetOutputOp(operands[0]));
-    arguments.emplace_back(loctx()->GetOutputOp(operands[1]));
-    // bias is optional
-    c10::optional<at::Tensor> nullArg;
-    if (operands.size() <= kBiasOperandsOffset) {
-      arguments.emplace_back(nullArg);
-    } else {
-      arguments.emplace_back(
-          loctx()->GetOutputOp(operands[kBiasOperandsOffset]));
-    }
-    arguments.emplace_back(conv->stride());
-    arguments.emplace_back(conv->padding());
-    arguments.emplace_back(conv->dilation());
-    arguments.emplace_back(conv->transposed());
-    arguments.emplace_back(conv->output_padding());
-    arguments.emplace_back(conv->groups());
-    // TODO: backend information is exposed too early here.
-    // Clean up after convolution unification is done.
-    auto& ctx = at::globalContext();
-    arguments.emplace_back(ctx.benchmarkCuDNN());  // benchmark
-    arguments.emplace_back(ctx.deterministicCuDNN() ||
-                           ctx.deterministicAlgorithms());  // deterministic
-    arguments.emplace_back(ctx.userEnabledCuDNN());         // cudnn_enabled
-    arguments.emplace_back(ctx.allowTF32CuDNN());           // allow_tf32
-
-    // Invoke aten::_convolution instead of aten::convolution_overrideable
-    return LowerBuiltin(at::aten::_convolution, arguments);
-  }
-
-  TSOpVector LowerConstantPad(const torch_lazy_tensors::ir::ops::ConstantPadNd* node) {
-    std::vector<torch::jit::NamedValue> arguments;
-    arguments.emplace_back(loctx()->GetOutputOp(node->operand(0)));
-    arguments.emplace_back(node->pad());
-    arguments.emplace_back(node->value());
-    return LowerBuiltin(node, arguments);
-  }
-
-  TSOpVector LowerExpand(const torch_lazy_tensors::ir::ops::Expand* node) {
+  TSOpVector LowerExpand(const torch::lazy::Expand* node) {
     std::vector<torch::jit::NamedValue> arguments;
     arguments.emplace_back(loctx()->GetOutputOp(node->operand(0)));
     arguments.emplace_back(node->size());
@@ -413,7 +297,7 @@ class TSNodeLowering : public TSNodeLoweringInterface {
     return LowerBuiltin(node, arguments);
   }
 
-  TSOpVector LowerScalar(const torch_lazy_tensors::ir::ops::Scalar* node) {
+  TSOpVector LowerScalar(const torch::lazy::Scalar* node) {
     const at::Scalar& value = node->value();
     const torch::lazy::Shape& shape = node->shape();
     auto options =

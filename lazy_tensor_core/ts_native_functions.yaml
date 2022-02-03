@@ -9,9 +9,17 @@ full_codegen:
   - addcdiv
   - addcmul
   - addmm
+  - arange.start_out
+  - avg_pool2d
+  - avg_pool2d_backward
   - baddbmm
+  - binary_cross_entropy
+  - binary_cross_entropy_backward
   - bitwise_and.Tensor
   - bmm
+  - constant_pad_nd
+  - convolution
+  - convolution_backward
   - cos
   - clamp
   - div.Tensor
@@ -45,9 +53,12 @@ full_codegen:
   - lt.Tensor
   - masked_fill_.Scalar
   - masked_fill_.Tensor
+  - max_pool2d_with_indices
+  - max_pool2d_with_indices_backward
   - mean
   - mean.dim
   - mm
+  - mul.Tensor
   - mv
   - native_dropout
   - native_dropout_backward
@@ -57,12 +68,15 @@ full_codegen:
   - ne.Tensor
   - nll_loss_backward
   - nll_loss_forward
+  - nll_loss2d_backward
+  - nll_loss2d_forward
   - pow.Tensor_Scalar
   - pow.Tensor_Tensor
   - relu
   - relu_
   - rsqrt
   - sigmoid
+  - sigmoid_backward
   - silu
   - smooth_l1_loss
   - smooth_l1_loss_backward
@@ -76,10 +90,12 @@ full_codegen:
   - sum
   - sum.dim_IntList
   - tanh
+  - tanh_backward
   - threshold
   - threshold_backward
   - topk
   - trace
+  - triu
   - trunc
   - zero_
 supported:
@@ -89,21 +105,15 @@ supported:
   - bernoulli_.float
   - cat
   - clone
-  - constant_pad_nd
-  - convolution_overrideable
-  - convolution_backward_overrideable
   - _copy_from
   - _copy_from_and_resize
   - empty.memory_format
   - empty_strided
   - expand
   - fill_.Scalar
-  - mul.Tensor
-  - mul.Scalar
   - native_batch_norm
   - native_batch_norm_backward
-  - max_pool2d_with_indices
-  - max_pool2d_with_indices_backward
+  - normal_
   - max_pool3d_with_indices
   - max_pool3d_with_indices_backward
   - permute
@@ -128,7 +138,5 @@ supported:
   - sub.Scalar
   - view
   - alias
-  - tanh_backward
 autograd:
-  - max_pool2d
   - max_pool3d

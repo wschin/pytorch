@@ -436,9 +436,9 @@ test_xla() {
 # Do NOT run this test before any other tests, like test_python_shard, etc.
 # Because this function uninstalls the torch built from branch, and install
 # nightly version.
-test_backward_compatibility() {
+test_forward_backward_compatibility() {
   set -x
-  pushd test/backward_compatibility
+  pushd test/forward_backward_compatibility
   python -m venv venv
   # shellcheck disable=SC1091
   . venv/bin/activate
@@ -448,7 +448,7 @@ test_backward_compatibility() {
   deactivate
   rm -r venv
   pip show torch
-  python check_backward_compatibility.py --existing-schemas nightly_schemas.txt
+  python check_forward_backward_compatibility.py --existing-schemas nightly_schemas.txt
   popd
   set +x
   assert_git_not_dirty
@@ -517,13 +517,21 @@ test_docs_test() {
   .jenkins/pytorch/docs-test.sh
 }
 
+test_torch_fx2trt() {
+  pip install parameterized
+  time python test/run_test.py --fx2trt-tests --verbose
+  assert_git_not_dirty
+}
+
 # lazy_tensor_staging branch specific hacks, don't merge back to master.
 test_lazy_tensor_core() {
   ln -sf "$TORCH_LIB_DIR"/libtorch* torch/lib/
   ln -sf "$TORCH_LIB_DIR"/libshm* torch/lib/
   ln -sf "$TORCH_LIB_DIR"/libc10* torch/lib/
-  ln -sf "$PWD"/lazy_tensor_core/build/lib.linux-x86_64-3.6/_LAZYC.cpython-36m-x86_64-linux-gnu.so lazy_tensor_core/build/lib.linux-x86_64-3.6/libptltc.so
+  ln -sf "$PWD"/lazy_tensor_core/build/lib.linux-x86_64-3.7/_LAZYC.cpython-37m-x86_64-linux-gnu.so lazy_tensor_core/build/lib.linux-x86_64-3.7/libptltc.so
   lazy_tensor_core/test/cpp/build/test_ptltc
+  # this example script does not run on CI (import error)
+  #python lazy_tensor_core/example.py
   assert_git_not_dirty
 }
 
@@ -533,7 +541,7 @@ if ! [[ "${BUILD_ENVIRONMENT}" == *libtorch* || "${BUILD_ENVIRONMENT}" == *-baze
 fi
 
 if [[ "${BUILD_ENVIRONMENT}" == *backward* ]]; then
-  test_backward_compatibility
+  test_forward_backward_compatibility
   # Do NOT add tests after bc check tests, see its comment.
 elif [[ "${TEST_CONFIG}" == *xla* ]]; then
   install_torchvision
@@ -563,6 +571,9 @@ elif [[ "${BUILD_ENVIRONMENT}" == *-test2 || "${JOB_BASE_NAME}" == *-test2 || ("
   test_custom_script_ops
   test_custom_backend
   test_torch_function_benchmark
+elif [[ "${SHARD_NUMBER}" -gt 2 ]]; then
+  # Handle arbitrary number of shards
+  test_python_shard "$SHARD_NUMBER"
 elif [[ "${BUILD_ENVIRONMENT}" == *vulkan* ]]; then
   test_vulkan
 elif [[ "${BUILD_ENVIRONMENT}" == *-bazel-* ]]; then
@@ -572,6 +583,8 @@ elif [[ "${BUILD_ENVIRONMENT}" == *distributed* || "${JOB_BASE_NAME}" == *distri
   test_rpc
 elif [[ "${TEST_CONFIG}" = docs_test ]]; then
   test_docs_test
+elif [[ "${TEST_CONFIG}" == fx2trt ]]; then
+  test_torch_fx2trt
 else
   install_torchvision
   install_monkeytype

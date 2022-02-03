@@ -45,20 +45,170 @@
 
 // #include <functional>
 #include "torch/csrc/lazy/core/shape.h"
+#include <ATen/native/ConvUtils.h>
+#include <ATen/AccumulateType.h>
 #include "aten/src/ATen/native/ReduceOpsUtils.h"
 #include "lazy_tensor_core/csrc/ts_backend/LazyShapeInference.h"
 #include "torch/csrc/api/include/torch/enum.h"
+#include <iostream>
+#include <vector>
 
 namespace torch_lazy_tensors {
 namespace ir {
 namespace ops {
 using Shape = torch::lazy::Shape;
 
-std::vector<Shape> compute_shape_masked_fill(at::Tensor & self, const at::Tensor & mask, const at::Scalar & value) {
+
+// Copied from ATen/native/utils/ParamUtils.h, which aparently I can't include from here?
+std::vector<int64_t> expand_param_if_needed(
+    at::IntArrayRef list_param,
+    const char* param_name,
+    int64_t expected_dim) {
+  if (list_param.size() == 1) {
+    return std::vector<int64_t>(expected_dim, list_param[0]);
+  } else if ((int64_t)list_param.size() != expected_dim) {
+    std::ostringstream ss;
+    ss << "expected " << param_name << " to be a single integer value or a "
+       << "list of " << expected_dim << " values to match the convolution "
+       << "dimensions, but got " << param_name << "=" << list_param;
+    AT_ERROR(ss.str());
+  } else {
+    return list_param.vec();
+  }
+}
+
+std::vector<Shape> compute_shape_arange_out(const at::Scalar & start, const at::Scalar & end, const at::Scalar & step, at::Tensor & out) {
+  double size_d;
+  // shape inference code copied from RangeFactories.cpp arange_out function
+  // Note: AT_DISPATCH_ALL_TYPES_AND is just a macro that defines the correct c++ scalar_t type depending on out tensor
+  AT_DISPATCH_ALL_TYPES_AND(c10::kBFloat16, out.scalar_type(), "compute_shape_arange_out", [&]() {
+    // Note: acc_type further defines an accumulataion type depending on the scalar_t and whether its on cuda vs cpu.
+    using accscalar_t = at::acc_type<scalar_t, false>;
+    auto xstart = start.to<accscalar_t>();
+    auto xend = end.to<accscalar_t>();
+    auto xstep = step.to<accscalar_t>();
+
+    // we use double precision for (start - end) / step
+    // to compute size_d for consistency across devices.
+    // The problem with using accscalar_t is that accscalar_t might be float32 on gpu for a float32 scalar_t,
+    // but double on cpu for the same,
+    // and the effective output size starts differing on CPU vs GPU because of precision issues, which
+    // we dont want.
+    // the corner-case we do want to take into account is int64_t, which has higher precision than double
+    // NOLINTNEXTLINE(bugprone-branch-clone)
+    if (std::is_same<scalar_t, int64_t>::value) {
+      size_d = std::ceil(static_cast<double>(end.to<accscalar_t>() - start.to<accscalar_t>())
+                         / step.to<accscalar_t>());
+    } else {
+      size_d = std::ceil(static_cast<double>(end.to<double>() - start.to<double>())
+                         / step.to<double>());
+    }
+
+    TORCH_CHECK(xstep > 0 || xstep < 0, "step must be nonzero");
+    TORCH_CHECK(std::isfinite(static_cast<double>(xstart)) &&
+             std::isfinite(static_cast<double>(xend)),
+             "unsupported range: ", xstart, " -> ", xend);
+    TORCH_CHECK(((xstep > 0) && (xend >= xstart)) || ((xstep < 0) && (xend <= xstart)),
+             "upper bound and larger bound inconsistent with step sign");
+
+    TORCH_CHECK(size_d >= 0 && size_d <= static_cast<double>(std::numeric_limits<int64_t>::max()),
+             "invalid size, possible overflow?");
+  });
+
+  int64_t size = static_cast<int64_t>(size_d);
+
+
+  // From torch.arange docs:
+  // dtype (torch.dtype, optional) – the desired data type of returned tensor.
+  // Default: if None, uses a global default (see torch.set_default_tensor_type()).
+  // If dtype is not given, infer the data type from the other input arguments.
+  // If any of start, end, or stop are floating-point, the dtype is inferred to be the default dtype, see get_default_dtype().
+  // Otherwise, the dtype is inferred to be torch.int64.
+
+  // Since out tensor is specified, its dtype should always be used?
+  return {Shape(out.scalar_type(), {size})};
+}
+
+std::vector<Shape> compute_shape_binary_cross_entropy(const at::Tensor & self, const at::Tensor & target, const c10::optional<at::Tensor> & weight, int64_t reduction) {
+  if(reduction == at::Reduction::None) {
+    return {Shape(self.scalar_type(), self.sizes().vec())};
+  }
+  return {Shape(self.scalar_type(), {})};
+}
+
+std::vector<Shape> compute_shape_binary_cross_entropy_backward(const at::Tensor & grad_output, const at::Tensor & self, const at::Tensor & target, const c10::optional<at::Tensor> & weight, int64_t reduction) {
   return {Shape(self.scalar_type(), self.sizes().vec())};
 }
 
-std::vector<Shape> compute_shape_masked_fill(at::Tensor & self, const at::Tensor & mask, const at::Tensor & value) {
+
+std::vector<Shape> compute_shape_constant_pad_nd(const at::Tensor & self, at::IntArrayRef pad, const at::Scalar & value) {
+  // Based on aten/src/ATen/native/ConstantPadNd.cpp::constant_pad_nd
+  TORCH_CHECK(pad.size() % 2 == 0, "Length of pad must be even but instead it equals ",
+            pad.size());
+
+  auto input_sizes = self.sizes();
+  auto l_inp = self.dim();
+
+  auto l_pad = pad.size() / 2;
+  auto l_diff = l_inp - l_pad;
+  TORCH_CHECK(l_inp >= (int64_t)l_pad, "Length of pad should be no more than twice the number of "
+            "dimensions of the input. Pad length is ", pad.size(), "while the input has ",
+            l_inp, "dimensions.");
+
+  std::vector<int64_t> new_shape;
+  for (size_t i = 0; i < (size_t)l_diff; i ++) {
+      new_shape.emplace_back(input_sizes[i]);
+  }
+
+  for (const auto i : c10::irange((size_t)l_pad)) {
+      auto pad_idx = pad.size() - ((i + 1) * 2);
+      auto new_dim = input_sizes[l_diff + i] + pad[pad_idx] + pad[pad_idx + 1];
+      TORCH_CHECK(new_dim > 0, "The input size ", input_sizes[l_diff + i], ", plus negative padding ",
+                pad[pad_idx], " and ", pad[pad_idx + 1], " resulted in a negative output size, "
+                "which is invalid. Check dimension ", l_diff + i, " of your input.");
+      new_shape.emplace_back(new_dim);
+  }
+  return {Shape(self.scalar_type(), new_shape)};
+}
+
+std::vector<Shape> compute_shape_convolution_backward(const at::Tensor & grad_output, const at::Tensor & input, const at::Tensor & weight, c10::optional<at::IntArrayRef> bias_sizes, at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed, at::IntArrayRef output_padding, int64_t groups, ::std::array<bool,3> output_mask) {
+  if (bias_sizes.has_value()) {
+    return {Shape(input.scalar_type(), input.sizes().vec()),
+            Shape(weight.scalar_type(), weight.sizes().vec()),
+            Shape(grad_output.scalar_type(), bias_sizes.value().vec())};
+  } else {
+    // TODO(whc) not sure whether to return 2 shapes here, or a 3rd one that is empty
+    return {Shape(input.scalar_type(), input.sizes().vec()),
+            Shape(weight.scalar_type(), weight.sizes().vec())};
+  }
+}
+
+std::vector<Shape> compute_shape_convolution(const at::Tensor & input, const at::Tensor & weight, const c10::optional<at::Tensor> & bias, at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef dilation, bool transposed, at::IntArrayRef output_padding, int64_t groups) {
+
+  int64_t dim = weight.ndimension() - 2;
+  TORCH_CHECK(dim > 0, "weight should have at least three dimensions");
+
+  // at::convolution performs parameter expansion before running kernels on expanded parameters
+  // we must do the same.  Shape formulae access differnent dimensions of e.g. output_padding, but
+  // output_padding may be passed in as a scalar.  Sadly, accessing output_padding[1] in this case
+  // gives incorrect results rather than indexing error
+  auto expanded_stride = expand_param_if_needed(stride, "stride", dim);
+  auto expanded_padding = expand_param_if_needed(padding, "padding", dim);
+  auto expanded_dilation = expand_param_if_needed(dilation, "dilation", dim);
+  if (!transposed) {
+    return {Shape(input.scalar_type(), at::native::conv_output_size(input.sizes(), weight.sizes(), expanded_padding, expanded_stride, expanded_dilation))};
+  } else {
+    auto expanded_output_padding = expand_param_if_needed(output_padding, "output_padding", dim);
+    auto out_shape = at::native::conv_input_size(input.sizes(), weight.sizes(), expanded_padding, expanded_output_padding, expanded_stride, expanded_dilation, groups);
+    return {Shape(input.scalar_type(), out_shape)};
+  }
+}
+
+std::vector<Shape> compute_shape_masked_fill_(at::Tensor & self, const at::Tensor & mask, const at::Scalar & value) {
+  return {Shape(self.scalar_type(), self.sizes().vec())};
+}
+
+std::vector<Shape> compute_shape_masked_fill_(at::Tensor & self, const at::Tensor & mask, const at::Tensor & value) {
   return {Shape(self.scalar_type(), self.sizes().vec())};
 }
 
@@ -179,6 +329,10 @@ std::vector<Shape> compute_shape_relu(const at::Tensor& self) {
   return {Shape(self.scalar_type(), self.sizes().vec())};
 }
 
+std::vector<Shape> compute_shape_relu_(at::Tensor& self) {
+  return compute_shape_relu(self);
+}
+
 std::vector<Shape> compute_shape_bitwise_and(const at::Tensor& self, const at::Scalar& other) {
   return {Shape(self.scalar_type(), self.sizes().vec())};
 }
@@ -196,7 +350,7 @@ std::vector<Shape> compute_shape_sum(
   return {Shape(self.scalar_type(), {})};;
 }
 
-std::vector<Shape> compute_shape_zero(at::Tensor& self) {
+std::vector<Shape> compute_shape_zero_(at::Tensor& self) {
   return {Shape(self.scalar_type(), self.sizes().vec())};
 }
 
@@ -250,6 +404,24 @@ std::vector<Shape> compute_shape_log_sigmoid_forward(const at::Tensor& self) {
 std::vector<Shape> compute_shape_log_sigmoid_backward(const at::Tensor& grad_output, const at::Tensor& self, const at::Tensor& buffer) {
   // Based on definition of aten/src/ATen/native/Activation.cpp::log_sigmoid_backward_cpu*.
   return {Shape(grad_output.scalar_type(), grad_output.sizes().vec())};
+}
+
+std::vector<Shape> compute_shape_nll_loss2d_forward(
+    const at::Tensor& self, const at::Tensor& target,
+    const c10::optional<at::Tensor>& weight, int64_t reduction,
+    int64_t ignore_index) {
+  // Based on definition of aten/src/ATen/native/LossNLL2d.cpp:nll_loss2d_forward_cpu
+  auto sizes =
+      (reduction == at::Reduction::Reduction::None ? target.sizes().vec()
+                                                   : std::vector<int64_t>{});
+  return {Shape(self.scalar_type(), sizes), Shape(self.scalar_type(), {})};
+}
+
+std::vector<Shape> compute_shape_nll_loss2d_backward(
+    const at::Tensor& grad_output, const at::Tensor& self,
+    const at::Tensor& target, const c10::optional<at::Tensor>& weight,
+    int64_t reduction, int64_t ignore_index, const at::Tensor& total_weight) {
+  return {Shape(self.scalar_type(), self.sizes().vec())};
 }
 
 } // namespace ops

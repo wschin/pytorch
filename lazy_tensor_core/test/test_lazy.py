@@ -1,12 +1,9 @@
 import torch
-import copy
 
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.jit_utils import JitTestCase
-from torch.testing import FileCheck
 
 import lazy_tensor_core
-import lazy_tensor_core.debug.metrics as metrics
 
 lazy_tensor_core._LAZYC._ltc_init_ts_backend()
 torch.manual_seed(42)
@@ -38,7 +35,6 @@ class TestLazyTensor(JitTestCase):
             [conv_copy_out], [inp_copy, weight_copy, bias_copy], [grad_copy])
 
         jit_graph = lazy_tensor_core._LAZYC._get_ltc_tensors_backend([bias_copy_grad])
-        FileCheck().check("aten::sum(").run(jit_graph)
 
         # check numerics
         torch.testing.assert_allclose(bias_copy_grad.cpu(), bias_grad.cpu())
