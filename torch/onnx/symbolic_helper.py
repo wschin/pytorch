@@ -177,6 +177,7 @@ def parse_args(*arg_descriptors):
 
 def _scalar(x):
     """Convert a scalar tensor into a Python value."""
+    print('_scalar: ', x, x.type())
     assert x.numel() == 1
     return x.item()
 
@@ -324,6 +325,19 @@ def _is_fp(value):
                 warnings.warn("Type cannot be inferred, which might cause exported graph to produce incorrect results.")
             return type in ("Float", "Double", "Half", "BFloat16")
     return False
+
+def _is_bool(value):
+    if value:
+        if isinstance(value, torch.Tensor):
+            type = value.dtype
+            return type == "torch.bool"
+        else:
+            type = value.type().scalarType()
+            if type is None:
+                warnings.warn("Type cannot be inferred, which might cause exported graph to produce incorrect results.")
+            return type == "Bool"
+    return False
+
 
 def _generate_wrapped_number(g, scalar):
     """

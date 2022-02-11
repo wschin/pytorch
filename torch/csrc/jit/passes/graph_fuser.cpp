@@ -210,7 +210,7 @@ struct GraphFuser {
     // are not necessarily correct.
     if (node->owningBlock() != block_)
       return false;
-    return node->kind() == prim::FusionGroup || isSimpleMap(node);
+    return node->kind() == prim::FusionGroup || true;//isSimpleMap(node);
   }
 
   bool isFusableCatNode(Node* node) {
@@ -353,6 +353,13 @@ struct GraphFuser {
              input->node()->kind() != prim::Constant) ||
             (n->kind() == aten::_grad_sum_to_size &&
              input->type()->isSubtypeOf(*ListType::ofInts()))) {
+          auto in_group = subgraph.addInput();
+          in_group->setType(input->type());
+          inputs_map[input] = in_group;
+          group->addInput(input);
+        } else if (
+          input->type()->isSubtypeOf(*IntType::get()) &&
+          input->node()->kind() != prim::Constant) {
           auto in_group = subgraph.addInput();
           in_group->setType(input->type());
           inputs_map[input] = in_group;

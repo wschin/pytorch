@@ -82,12 +82,24 @@ def reshape_as(g, self, other):
 
 
 def add(g, self, other, alpha=None):
+    return g.op("Add", self, other)
+    # print all inputs. 
+    print('[opset9] def add: \n', self, '\n', other, '\n', alpha)
     if sym_help._is_value(self) and sym_help._is_tensor_list(self):
         return sym_help._onnx_opset_unsupported_detailed("Add", 9, 11, "Add between list of tensors not supported")
 
     # default alpha arg is to allow no-alpha add (aten add st overload no alpha)
     if alpha and sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
         return _unimplemented("add", "alpha != 1")
+    if alpha:
+      if sym_help._is_value(alpha):
+        print('def add(): ', self, other, alpha)
+        alpha_casted = g.op("Cast", alpha, to_i=sym_help.cast_pytorch_to_onnx[sym_help._try_get_scalar_type(self)])
+        other_casted = g.op("Cast", other, to_i=sym_help.cast_pytorch_to_onnx[sym_help._try_get_scalar_type(self)])
+        other = g.op("Mul", other_casted, alpha_casted)
+      elif sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
+        return _unimplemented("add", "alpha != 1")
+
     return g.op("Add", self, other)
 
 
@@ -103,7 +115,11 @@ def rsub(g, self, other, alpha=None):
 
 
 def mul(g, self, other):
-    return g.op("Mul", self, other)
+    if sym_help._is_bool(self):
+      return g.op("And", self, other)
+    else:
+      return g.op("Mul", self, other)
+
 
 
 def div(g, self, other, *args):
