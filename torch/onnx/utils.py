@@ -173,6 +173,10 @@ def _export_graph_to_file(graph, operator_export_type):
 def _optimize_graph_1(graph, operator_export_type, _disable_torch_constant_prop=False, fixed_batch_size=False,
                     params_dict=None, dynamic_axes=None, input_names=None, module=None):
     print('[pth] start _optimize_graph')
+    print_graph = False
+    if print_graph:
+      print('Init JIT model:')
+      print(graph)
     #print(graph)
     #for i in graph.inputs():
     #    print(i)
@@ -263,9 +267,7 @@ def _optimize_graph_1(graph, operator_export_type, _disable_torch_constant_prop=
     torch._C._jit_pass_onnx_lint(graph)
     torch._C._jit_pass_lint(graph)
 
-    print('[utils.py] _jit_pass_onnx_scalar_type_analysis\n', graph)
     torch._C._jit_pass_onnx_scalar_type_analysis(graph, True, _export_onnx_opset_version)
-    print('[utils.py] _jit_pass_onnx_scalar_type_analysis done\n', graph)
     torch._C._jit_pass_lint(graph)
 
     torch._C._jit_pass_onnx_peephole(graph, _export_onnx_opset_version, fixed_batch_size)
@@ -290,25 +292,20 @@ def _optimize_graph_1(graph, operator_export_type, _disable_torch_constant_prop=
     model_location = f'/bert_ort/wechi/model_{seed}.onnx'
     with torch.serialization._open_file_like(model_location, "wb") as opened_file:
         opened_file.write(proto)
-    import onnx
-    print('Compare final JIT graph and ONNX model in exporter: ', model_location)
-    print('JIT model:')
-    print(graph)
-    m_ = onnx.load(model_location)
-    print('ONNX model:')
-    print(m_)
-    print('[pth] done _optimize_graph')
+    if print_graph:
+      import onnx
+      print('Compare final JIT graph and ONNX model in exporter: ', model_location)
+      print('Final JIT model:')
+      print(graph)
+      m_ = onnx.load(model_location)
+      print('ONNX model:')
+      print(m_)
+      print('[pth] done _optimize_graph')
     return model_location
 
 
 def _optimize_graph(graph, operator_export_type, _disable_torch_constant_prop=False, fixed_batch_size=False,
                     params_dict=None, dynamic_axes=None, input_names=None, module=None):
-    print('[pth] start _optimize_graph')
-    print(graph)
-    for i in graph.inputs():
-        print(i)
-    for o in graph.outputs():
-        print(o)
     # Inline everything
     torch._C._jit_pass_inline(graph)
 
@@ -403,19 +400,11 @@ def _optimize_graph(graph, operator_export_type, _disable_torch_constant_prop=Fa
     # elimination variant that doesn't need to look up if an op has side effects.
     torch._C._jit_pass_dce_allow_deleting_nodes_with_side_effects(onnx_graph)
     torch._C._jit_pass_lint(onnx_graph)
-    graph = torch._C._jit_pass_canonicalize(onnx_graph)
+    onnx_graph = torch._C._jit_pass_canonicalize(onnx_graph)
     torch._C._jit_pass_lint(onnx_graph)
     if _onnx_shape_inference:
         torch._C._jit_pass_onnx_graph_shape_type_inference(onnx_graph, params_dict, _export_onnx_opset_version)
 
-    import random, string
-    seed  = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-    proto, export_map, val_use_external_data_format = onnx_graph._export_onnx({}, 12, {}, False, operator_export_type, False, False, {}, True, f'/bert_ort/wechi/model_{seed}', {})
-    print(proto)
-    assert(len(export_map) == 0)
-    with torch.serialization._open_file_like(f'/bert_ort/wechi/model_{seed}.onnx', "wb") as opened_file:
-        opened_file.write(proto)
-    print('[pth] done _optimize_graph')
     return onnx_graph
 
 
