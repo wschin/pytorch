@@ -33,5 +33,11 @@ TORCH_API void CustomFuseGraph(
     Symbol kind,
     size_t arg_limit = std::numeric_limits<size_t>::max());
 
+TORCH_API void MyFuseGraph(
+    std::shared_ptr<Graph>& graph,
+    const std::function<bool(Node*)>& fn,
+    Symbol kind,
+    size_t arg_limit = std::numeric_limits<size_t>::max());
+
 } // namespace jit
 } // namespace torch
