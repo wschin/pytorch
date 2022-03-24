@@ -1,5 +1,6 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/core/jit_type.h>
+#include <sstream>
 
 namespace c10 {
 
@@ -268,7 +269,12 @@ TensorTypePtr TensorType::create(
 }
 
 std::string TensorType::str() const {
-  return "Tensor";
+  std::stringstream ss;
+  ss << "Tensor";
+  if (scalar_type_.has_value()) {
+    ss << "[" << scalar_type_.value() << "]";
+  }
+  return ss.str();
 }
 
 std::atomic<size_t> ShapeSymbol::num_symbols{1};

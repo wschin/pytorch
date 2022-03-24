@@ -1462,20 +1462,55 @@ struct MyGraphFuser {
     // (as a legacy from tensors only)
     WithInsertPoint guard(*subgraph.nodes().begin());
     for (auto input : n->inputs()) {
-      if(inputs_map.count(input) != 0) {
-        continue;
+      if (inputs_map.count(input) == 0) {
+        if (input->type()->isSubtypeOf(*TensorType::get())) {
+          group->addInput(input);
+          // Add the corresponding input to subgraph's input list.
+          auto inner_input = subgraph.addInput();
+          inner_input->setType(input->type());
+          // Update outer-to-inner value mapping.
+          inputs_map[input] = inner_input;
+        } else if (
+            (input->type()->isSubtypeOf(*FloatType::get()) &&
+             input->node()->kind() != prim::Constant) ||
+            (n->kind() == aten::_grad_sum_to_size &&
+             input->type()->isSubtypeOf(*ListType::ofInts()))) {
+          group->addInput(input);
+          auto inner_input = subgraph.addInput();
+          inner_input->setType(input->type());
+          inputs_map[input] = inner_input;
+        } else if (
+          input->type()->isSubtypeOf(*IntType::get()) &&
+          input->node()->kind() != prim::Constant) {
+          group->addInput(input);
+          auto inner_input = subgraph.addInput();
+          inner_input->setType(input->type());
+          inputs_map[input] = inner_input;
+        } else {
+          // We don't support passing in scalars as arguments to fused kernels,
+          // so we generally don't allow fusing tensor-scalar operations unless
+          // the scalar is constant. In those cases we inline the constants
+          // directly in the body of the fused group.
+          AT_ASSERT(input->node()->kind() == prim::Constant);
+          Node* in_const =
+              subgraph.createClone(input->node(), [](Value*) -> Value* {
+                throw std::runtime_error("unexpected input");
+              });
+          subgraph.insertNode(in_const);
+          inputs_map[input] = in_const->output();
+        }
       }
-      // Fusion group and its contained subgraph has the same input list.
-      // group->inputs().at(i) and subgraph.inputs().at(i) are aliases of
-      // the same actual variable.
-      AT_ASSERT(group->inputs().size() == subgraph.inputs().size());
-      // Add input to fusion group's input list.
-      group->addInput(input);
-      // Add the corresponding input to subgraph's input list.
-      auto inner_input = subgraph.addInput();
-      inner_input->setType(input->type());
-      // Update outer-to-inner value mapping.
-      inputs_map[input] = inner_input;
+      //// Fusion group and its contained subgraph has the same input list.
+      //// group->inputs().at(i) and subgraph.inputs().at(i) are aliases of
+      //// the same actual variable.
+      //AT_ASSERT(group->inputs().size() == subgraph.inputs().size());
+      //// Add input to fusion group's input list.
+      //group->addInput(input);
+      //// Add the corresponding input to subgraph's input list.
+      //auto inner_input = subgraph.addInput();
+      //inner_input->setType(input->type());
+      //// Update outer-to-inner value mapping.
+      //inputs_map[input] = inner_input;
     }
     // copy n into the graph, remapping its inputs to internal nodes
     Node* n_in_graph = subgraph.createClone(
@@ -1561,18 +1596,20 @@ struct MyGraphFuser {
       mergeFusionGroups(group, producer->node());
       return group;
     }
-    AT_ASSERT(producer->node()->outputs().size() == 1);
+    //AT_ASSERT(producer->node()->outputs().size() == 1);
     Node* merged = mergeNodeIntoGroup(group, producer->node());
     // remaining uses of this producer can occur because we allow
     // fusion in cases where uses remain after the consumer
     // if these exist, re-route them to the version of producer
     // created in FusionGroup
-    if (producer->uses().size() != 0) {
-      getSubgraph(group).registerOutput(merged->output());
-      Value* new_producer = group->addOutput();
-      new_producer->copyMetadata(producer);
-      aliasDb_->replaceWithNewValue(producer, new_producer);
-      producer->replaceAllUsesWith(new_producer);
+    for (auto output : producer->node()->outputs()) {
+      if (output->uses().size() == 0) {
+        continue;
+      }
+      Value* new_output = group->addOutput();
+      new_output->copyMetadata(new_output);
+      aliasDb_->replaceWithNewValue(output, new_output);
+      output->replaceAllUsesWith(new_output);
     }
     producer->node()->destroy();
     return group;

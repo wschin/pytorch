@@ -47,7 +47,6 @@ def dropout(g, input, p, train):
     r, _ = g.op("Dropout", input, p, t, outputs=2)
     return r
 
-
 def nll_loss(g, self, target, weight, reduction, ignore_index):
     # none reduction : onnx::Constant[value={0}]
     # mean reduction : onnx::Constant[value={1}]
@@ -65,7 +64,6 @@ def nll_loss(g, self, target, weight, reduction, ignore_index):
         nllloss = g.op("NegativeLogLikelihoodLoss", self, target, weight, reduction_s=reduction, ignore_index_i=ignore_index)
 
     return nllloss
-
 
 def nll_loss2d(g, self, target, weight, reduction, ignore_index):
     return nll_loss(g, self, target, weight, reduction, ignore_index)

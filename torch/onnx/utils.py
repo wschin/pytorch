@@ -1477,6 +1477,15 @@ def _validate_dynamic_axes(dynamic_axes, model, input_names, output_names):
             dynamic_axes[key] = value_dict
 
 
+def _export_jit_graph_to_onnx_model_proto(graph, operator_export_type, onnx_opset_version):
+    graph = _optimize_graph(graph, operator_export_type, params_dict={})
+    proto, export_map, val_use_external_data_format = graph._export_onnx(
+        {}, onnx_opset_version, {}, False,
+        operator_export_type, False, False,
+        {}, True, '', {})
+    return proto
+
+
 torch._C.Graph.op = _graph_op  # type: ignore[attr-defined]
 torch._C.Graph.at = _graph_at  # type: ignore[attr-defined]
 torch._C.Block.op = _block_op  # type: ignore[attr-defined]
