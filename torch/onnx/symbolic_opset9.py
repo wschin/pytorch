@@ -80,81 +80,89 @@ def reshape_as(g, self, other):
     shape = g.op("Shape", other)
     return reshape(g, self, shape)
 
-#def add(g, self, other, alpha=None):
-#    if sym_help._is_value(self) and sym_help._is_tensor_list(self):
-#        return sym_help._onnx_opset_unsupported_detailed("Add", 9, 11, "Add between list of tensors not supported")
-#
-#    # default alpha arg is to allow no-alpha add (aten add st overload no alpha)
-#    if alpha and sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
-#        return _unimplemented("add", "alpha != 1")
-#    return g.op("Add", self, other)
-
-def find_cast_target_type(g, self, other):
-    target_type = None
-    self_type = sym_help._try_get_scalar_type(self)
-    other_type = sym_help._try_get_scalar_type(other)
-    if self_type == other_type:
-      target_type = self_type
-    elif self_type == 'Float' and other_type == 'Double':
-      target_type = 'Double'
-    elif self_type == 'Double' and other_type == 'Float':
-      target_type = 'Double'
-    elif self_type and not other_type:
-      target_type = self_type
-    elif other_type and not self_type:
-      target_type = other_type
-    # default alpha arg is to allow no-alpha add (aten add st overload no alpha)
-    def is_good_tensor(value):
-      return sym_help._is_tensor(value) and sym_help._get_tensor_rank(value) > 0
-    def is_bad_tensor(value):
-      return sym_help._is_tensor(value) and sym_help._get_tensor_rank(value) == 0
-    if is_good_tensor(self) and is_bad_tensor(other):
-      target_type = self_type
-    elif is_good_tensor(other) and is_bad_tensor(self):
-      target_type = other_type
-    
-
-    if target_type and target_type != self_type:
-      casted_self = g.op("Cast", self, to_i=sym_help.cast_pytorch_to_onnx[target_type])
-    else:
-      casted_self = self
-
-    if target_type and target_type != other_type:
-      casted_other = g.op("Cast", other, to_i=sym_help.cast_pytorch_to_onnx[target_type])
-    else:
-      casted_other = other
-
-    return target_type, casted_self, casted_other
 
 def add(g, self, other, alpha=None):
-    # print all inputs. 
-    print('[opset9] def add: \n', self, '\n', other, '\n', alpha)
     if sym_help._is_value(self) and sym_help._is_tensor_list(self):
         return sym_help._onnx_opset_unsupported_detailed("Add", 9, 11, "Add between list of tensors not supported")
-    
-    target_type, self, other = find_cast_target_type(g, self, other)
 
-    if alpha:
-      if sym_help._is_value(alpha):
-        alpha = g.op("Cast", alpha, to_i=sym_help.cast_pytorch_to_onnx[target_type])
-        other = g.op("Mul", other, alpha)
-      elif sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
+    # default alpha arg is to allow no-alpha add (aten add st overload no alpha)
+    if alpha and sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
         return _unimplemented("add", "alpha != 1")
-
     return g.op("Add", self, other)
 
 
 def sub(g, self, other, alpha=None):
-    target_type, self, other = find_cast_target_type(g, self, other)
     # default alpha arg is to allow no-alpha sub (aten sub st overload no alpha)
-    if alpha:
-      if sym_help._is_value(alpha):
-        alpha_casted = g.op("Cast", alpha, to_i=sym_help.cast_pytorch_to_onnx[target_type])
-        other = g.op("Mul", other, alpha_casted)
-      elif sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
-        return _unimplemented("add", "alpha != 1")
-
+    if alpha and sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
+        return _unimplemented("sub", "alpha != 1")
     return g.op("Sub", self, other)
+
+#def find_cast_target_type(g, self, other):
+#    target_type = None
+#    self_type = sym_help._try_get_scalar_type(self)
+#    other_type = sym_help._try_get_scalar_type(other)
+#    if self_type == other_type:
+#      target_type = self_type
+#    elif self_type == 'Float' and other_type == 'Double':
+#      target_type = 'Double'
+#    elif self_type == 'Double' and other_type == 'Float':
+#      target_type = 'Double'
+#    elif self_type and not other_type:
+#      target_type = self_type
+#    elif other_type and not self_type:
+#      target_type = other_type
+#    # default alpha arg is to allow no-alpha add (aten add st overload no alpha)
+#    def is_good_tensor(value):
+#      return sym_help._is_tensor(value) and sym_help._get_tensor_rank(value) > 0
+#    def is_bad_tensor(value):
+#      return sym_help._is_tensor(value) and sym_help._get_tensor_rank(value) == 0
+#    if is_good_tensor(self) and is_bad_tensor(other):
+#      target_type = self_type
+#    elif is_good_tensor(other) and is_bad_tensor(self):
+#      target_type = other_type
+#    
+#
+#    if target_type and target_type != self_type:
+#      casted_self = g.op("Cast", self, to_i=sym_help.cast_pytorch_to_onnx[target_type])
+#    else:
+#      casted_self = self
+#
+#    if target_type and target_type != other_type:
+#      casted_other = g.op("Cast", other, to_i=sym_help.cast_pytorch_to_onnx[target_type])
+#    else:
+#      casted_other = other
+#
+#    return target_type, casted_self, casted_other
+#
+#def add(g, self, other, alpha=None):
+#    # print all inputs. 
+#    print('[opset9] def add: \n', self, '\n', other, '\n', alpha)
+#    if sym_help._is_value(self) and sym_help._is_tensor_list(self):
+#        return sym_help._onnx_opset_unsupported_detailed("Add", 9, 11, "Add between list of tensors not supported")
+#    
+#    target_type, self, other = find_cast_target_type(g, self, other)
+#
+#    if alpha:
+#      if sym_help._is_value(alpha):
+#        alpha = g.op("Cast", alpha, to_i=sym_help.cast_pytorch_to_onnx[target_type])
+#        other = g.op("Mul", other, alpha)
+#      elif sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
+#        return _unimplemented("add", "alpha != 1")
+#
+#    return g.op("Add", self, other)
+
+
+#def sub(g, self, other, alpha=None):
+#    target_type, self, other = find_cast_target_type(g, self, other)
+#    # default alpha arg is to allow no-alpha sub (aten sub st overload no alpha)
+#    if alpha:
+#      if sym_help._is_value(alpha):
+#        alpha_casted = g.op("Cast", alpha, to_i=sym_help.cast_pytorch_to_onnx[target_type])
+#        other = g.op("Mul", other, alpha_casted)
+#      elif sym_help._scalar(sym_help._maybe_get_scalar(alpha)) != 1:
+#        return _unimplemented("add", "alpha != 1")
+#
+#    return g.op("Sub", self, other)
 
 
 def rsub(g, self, other, alpha=None):
@@ -162,7 +170,7 @@ def rsub(g, self, other, alpha=None):
 
 
 def mul(g, self, other):
-    target_type, self, other = find_cast_target_type(g, self, other)
+    #target_type, self, other = find_cast_target_type(g, self, other)
     print('[opset9] def mul: \n', self, '\n', other, '\n')
     if sym_help._is_bool(self):
       return g.op("And", self, other)

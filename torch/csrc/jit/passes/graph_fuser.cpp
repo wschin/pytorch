@@ -1602,10 +1602,13 @@ struct MyGraphFuser {
     // fusion in cases where uses remain after the consumer
     // if these exist, re-route them to the version of producer
     // created in FusionGroup
+    size_t i = -1;
     for (auto output : producer->node()->outputs()) {
+      ++i;
       if (output->uses().size() == 0) {
         continue;
       }
+      getSubgraph(group).registerOutput(merged->outputs()[i]);
       Value* new_output = group->addOutput();
       new_output->copyMetadata(new_output);
       aliasDb_->replaceWithNewValue(output, new_output);

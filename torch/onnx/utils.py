@@ -1477,10 +1477,14 @@ def _validate_dynamic_axes(dynamic_axes, model, input_names, output_names):
             dynamic_axes[key] = value_dict
 
 
-def _export_jit_graph_to_onnx_model_proto(graph, operator_export_type, onnx_opset_version):
+def _export_jit_graph_to_onnx_model_proto(graph, operator_export_type):
+    from torch.onnx.symbolic_helper import _set_onnx_shape_inference
+    from torch.onnx.symbolic_helper import _export_onnx_opset_version
+    _set_onnx_shape_inference(True)
     graph = _optimize_graph(graph, operator_export_type, params_dict={})
     proto, export_map, val_use_external_data_format = graph._export_onnx(
-        {}, onnx_opset_version, {}, False,
+        #{}, _export_onnx_opset_version, {}, False,
+        {}, 13, {}, False,
         operator_export_type, False, False,
         {}, True, '', {})
     return proto
