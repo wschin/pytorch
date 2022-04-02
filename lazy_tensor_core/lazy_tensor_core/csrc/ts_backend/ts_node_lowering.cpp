@@ -2,6 +2,7 @@
 
 #include <ATen/Functions.h>
 #include <torch/csrc/jit/frontend/sugared_value.h>
+#include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/lazy/backend/backend_interface.h>
 #include <torch/csrc/lazy/core/helpers.h>
 #include <torch/csrc/lazy/ts_backend/ops/cast.h>
@@ -19,10 +20,9 @@
 #include <torch/csrc/lazy/core/view_ops/select_view_update.h>
 #include <torch/csrc/lazy/core/view_ops/view.h>
 #include <torch/csrc/lazy/ts_backend/ts_lowering_context.h>
+#include <torch/csrc/lazy/core/lazy_graph_executor.h>
 
-#include "lazy_tensor_core/csrc/ops/repeat.h"
 #include "lazy_tensor_core/csrc/ops/squeeze.h"
-#include "lazy_tensor_core/csrc/ops/stack.h"
 #include "lazy_tensor_core/csrc/ops/ts_native_batch_norm_backward.h"
 #include "lazy_tensor_core/csrc/ops/ts_native_batch_norm_forward.h"
 #include "lazy_tensor_core/csrc/ops/unsqueeze.h"
@@ -94,11 +94,6 @@ class TSNodeLowering : public TSNodeLoweringInterface {
       return LowerScalar(torch::lazy::NodeCast<torch::lazy::Scalar>(
           node, torch::lazy::OpKind(at::prim::Constant)));
     }
-    if (node->op().op == at::aten::bernoulli) {
-      std::vector<torch::jit::NamedValue> arguments;
-      arguments.emplace_back(loctx()->GetOutputOp(node->operand(0)));
-      return LowerBuiltin(node, arguments);
-    }
     if (node->op().op == at::aten::native_batch_norm) {
       return LowerBatchNorm(
           torch::lazy::NodeCast<
@@ -124,11 +119,6 @@ class TSNodeLowering : public TSNodeLoweringInterface {
       return LowerPermute(torch::lazy::NodeCast<torch::lazy::Permute>(
           node, torch::lazy::OpKind(at::aten::permute)));
     }
-    if (node->op().op == at::aten::repeat) {
-      return LowerRepeat(
-          torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::Repeat>(
-              node, torch::lazy::OpKind(at::aten::repeat)));
-    }
     if (node->op().op == at::aten::select) {
       return LowerSelect(torch::lazy::NodeCast<torch::lazy::Select>(
           node, torch::lazy::OpKind(at::aten::select)));
@@ -137,11 +127,6 @@ class TSNodeLowering : public TSNodeLoweringInterface {
       return LowerSqueeze(
           torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::Squeeze>(
               node, torch::lazy::OpKind(at::aten::squeeze)));
-    }
-    if (node->op().op == at::aten::stack) {
-      return LowerStack(
-          torch::lazy::NodeCast<torch_lazy_tensors::ir::ops::Stack>(
-              node, torch::lazy::OpKind(at::aten::stack)));
     }
     if (node->op().op == at::aten::unsqueeze) {
       return LowerUnsqueeze(
@@ -156,8 +141,14 @@ class TSNodeLowering : public TSNodeLoweringInterface {
       const torch::lazy::DeviceData* device_data_node =
           torch::lazy::NodeCast<torch::lazy::DeviceData>(
               node, *torch::lazy::ltc_device_data);
+      auto infoptr = device_data_node->data()->info();
+      auto deviceDataInfoPtr = (torch::lazy::LazyGraphExecutor::DeviceDataInfo*) infoptr;
+      if (GRAPH_DUMP_ENABLED) {
+        LOG(ERROR) << "Lowering device data node, tensor id " << deviceDataInfoPtr->tensor_id << std::endl;
+      }
       return {loctx()->GetParameter(device_data_node->data())};
     }
+
     std::vector<torch::jit::NamedValue> arguments;
     for (const torch::lazy::Output& output : node->operands()) {
       arguments.emplace_back(loctx()->GetOutputOp(output));
@@ -193,8 +184,7 @@ class TSNodeLowering : public TSNodeLoweringInterface {
     torch::jit::Value* destination =
         GenerateClone(loctx()->GetOutputOp(node->operand(0)));
     const torch::lazy::Output& input_op = node->operand(1);
-    const torch::lazy::Shape& input_shape =
-        torch::lazy::GetShapeFromTsOutput(input_op);
+    const torch::lazy::Shape& input_shape = input_op.shape();
     const auto input_dimensions = input_shape.sizes();
     std::vector<torch::jit::NamedValue> dest_arguments;
     dest_arguments.emplace_back(destination);
@@ -271,8 +261,7 @@ class TSNodeLowering : public TSNodeLoweringInterface {
     torch::jit::Value* base = loctx()->GetOutputOp(input);
     const auto& base_indices = node->base_indices();
     const auto& sizes = node->sizes();
-    const torch::lazy::Shape& input_shape =
-        torch::lazy::GetShapeFromTsOutput(input);
+    const torch::lazy::Shape& input_shape = input.shape();
     CHECK_EQ(sizes.size(), base_indices.size());
     CHECK_EQ(input_shape.dim(), base_indices.size());
     for (size_t dim = 0; dim < base_indices.size(); ++dim) {
@@ -287,13 +276,6 @@ class TSNodeLowering : public TSNodeLoweringInterface {
     std::vector<torch::jit::NamedValue> arguments;
     arguments.emplace_back(loctx()->GetOutputOp(node->operand(0)));
     arguments.push_back(node->dims());
-    return LowerBuiltin(node, arguments);
-  }
-
-  TSOpVector LowerRepeat(const torch_lazy_tensors::ir::ops::Repeat* node) {
-    std::vector<torch::jit::NamedValue> arguments;
-    arguments.emplace_back(loctx()->GetOutputOp(node->operand(0)));
-    arguments.push_back(node->repeats());
     return LowerBuiltin(node, arguments);
   }
 
@@ -326,23 +308,6 @@ class TSNodeLowering : public TSNodeLoweringInterface {
     return LowerBuiltin(node, arguments);
   }
 
-  TSOpVector LowerStack(const torch_lazy_tensors::ir::ops::Stack* stack) {
-    std::vector<torch::jit::NamedValue> arguments;
-    std::vector<torch::jit::Value*> tensor_list;
-    const auto& operands = stack->operands();
-    CHECK(!operands.empty());
-    for (const torch::lazy::Output& operand : operands) {
-      tensor_list.emplace_back(loctx()->GetOutputOp(operand));
-    }
-    auto graph = function_->graph();
-    arguments.emplace_back(
-        graph
-            ->insertNode(graph->createList(tensor_list[0]->type(), tensor_list))
-            ->output());
-    arguments.emplace_back(stack->dim());
-    return LowerBuiltin(stack, arguments);
-  }
-
   TSOpVector LowerSelectViewUpdate(const torch::lazy::SelectViewUpdate* node) {
     torch::jit::Value* dest =
         GenerateClone(loctx()->GetOutputOp(node->operand(0)));
@@ -360,8 +325,7 @@ class TSNodeLowering : public TSNodeLoweringInterface {
         GenerateClone(loctx()->GetOutputOp(node->operand(0)));
     const auto& base_indices = node->base_indices();
     const torch::lazy::Output& source_argument = node->operand(1);
-    const torch::lazy::Shape& source_shape =
-        torch::lazy::GetShapeFromTsOutput(source_argument);
+    const torch::lazy::Shape& source_shape = source_argument.shape();
     CHECK_EQ(source_shape.dim(), base_indices.size());
     torch::jit::Value* base = dest;
     for (size_t dim = 0; dim < base_indices.size(); ++dim) {

@@ -5,6 +5,11 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
+// an external backend might generate file within its code tree
+// and check all the source files within the tree with clang-format.
+// so, disable it since the backend might have a different config.
+// clang-format off
+
 // NOTE: This condition is true for all PyTorch internal libraries, it
 //       just excludes external projects such as torch_xla which
 //       re-use some of the PyTorch codegen machinery.
@@ -45,6 +50,15 @@ $external_backend_headers
 $dispatch_headers
 $ops_headers
 
+#ifndef EAGER_REGISTRATION
+#define EAGER_REGISTRATION 1
+#endif
+
+namespace ${cpp_namespace} {
+
+std::function<void(void)> Register${BackendName}${DispatchKey}Modules;
+
+} // namespace ${cpp_namespace}
 
 namespace at {
 
@@ -58,7 +72,22 @@ ${dispatch_helpers}
 ${dispatch_anonymous_definitions}
 
 TORCH_LIBRARY_IMPL(aten, ${DispatchKey}, m) {
-  ${dispatch_registrations}
+  ${cpp_namespace}::Register${BackendName}${DispatchKey}Modules = [&]() {
+
+    ${dispatch_registrations}
+
+  };
+
+  // For external backends, the EAGER_REGISTRATION macro will be set to 1,
+  // causing the module registration function to be called at the same time
+  // it used to be called, in other words, at c++ static initialization time.
+  // For LTC backends (i.e. the lazy TorchScript backend) the EAGER_REGISTRATION
+  // macro will be set to 0 makes the c++ static initializer simply install
+  // a function pointer, and then only upon initializing the LTC backend
+  // (i.e. via a call to say init_ts_backend) is it finally invoked.
+  #if EAGER_REGISTRATION
+  ${cpp_namespace}::Register${BackendName}${DispatchKey}Modules();
+  #endif
 }
 
 } // anonymous namespace

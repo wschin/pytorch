@@ -61,12 +61,14 @@ log = logging.getLogger(__name__)
 # Models that are known to crash or otherwise not work with lazy tensor are
 # disabled, but should be removed from these lists once fixed
 SKIP = {
-    "densenet121": "OOMs on eager CUDA CI machine (T4 GPU)",
-    "timm_nfnet": "OOMs on eager CUDA CI machine (T4 GPU)",
+    "densenet121": "Disabled by torchbench upstream due to OOM on T4 CI machine",
+    "timm_nfnet": "Disabled by torchbench upstream due to OOM on T4 CI machine",
     "moco": "Distributed/ProcessGroupNCCL: Tensors must be CUDA and dense",
+    "tacotron2": "Disabled by torchbench upstream due to OOM on T4 CI machine",
 }
 SKIP_TRAIN_ONLY = {
-    "squeezenet1_1": "OOMs on eager CUDA CI machine (T4 GPU)",
+    "squeezenet1_1": "Disabled by torchbench upstream due to OOM on T4 CI machine",
+    "demucs": "Disabled by torchbench upstream due to OOM on T4 CI machine",
 }
 
 current_name = ""
@@ -92,7 +94,8 @@ class HardSwishBenchmark:
         self.name = "HardSwishBenchmark(dims=[" + ','.join([str(d) for d in dims]) + '])'
         self.dims = dims
 
-    def __call__(self, device, jit):
+    # test and extra_args are placeholders to match TorchBench API
+    def __call__(self, device, jit, test, extra_args):
         return HardSwish(self.dims, device, jit)
 
 class HardSwish(nn.Module):
@@ -119,7 +122,8 @@ class DivAddMulBenchmark:
         self.name = "DivAddMulBenchmark(dims=[" + ','.join([str(d) for d in dims]) + '])'
         self.dims = dims
 
-    def __call__(self, device, jit):
+    # test and extra_args are placeholders to match TorchBench API
+    def __call__(self, device, jit, test, extra_args):
         return DivAddMul(self.dims, device, jit)
 
 class DivAddMul(nn.Module):
@@ -598,8 +602,9 @@ if __name__ == "__main__" :
                         help="Run the tracing portion only, with noop backend, useful for running under a profiler.")
     parser.add_argument("--run_in_subprocess", "-s", type=str,
                         help="which model run in subprocess. This will ignore filter and exclude")
-    parser.add_argument("--allclose_atol", type=float, default=1e-8,
+    parser.add_argument("--allclose_atol", type=float, default=1e-4,
                         help="Absolute tolerance to check lazy result again the correct result")
+    parser.add_argument("--fp16", choices=["no", "half", "amp"], default="no", help="enable fp16 modes from: no fp16, half, or amp")
     args = parser.parse_args()
     results = []
 
@@ -635,9 +640,9 @@ if __name__ == "__main__" :
 
                     # no try since we should've already filtered out models we can't create
                     set_seeds()
-                    benchmark = benchmark_cls(device=args.device, jit=False)
+                    benchmark = benchmark_cls(test=args.test, device=args.device, jit=False, extra_args=["--fp16", args.fp16])
                     set_seeds()
-                    lazy_benchmark = benchmark_cls(device='lazy', jit=False)
+                    lazy_benchmark = benchmark_cls(test=args.test, device='lazy', jit=False, extra_args=["--fp16", args.fp16])
                     # TODO: might be redundant
                     gc.collect()
 

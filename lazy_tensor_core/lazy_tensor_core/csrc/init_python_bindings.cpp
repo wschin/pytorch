@@ -6,6 +6,8 @@
 #include <torch/csrc/lazy/core/ir_dump_util.h>
 #include <torch/csrc/lazy/core/ir_util.h>
 #include <torch/csrc/lazy/core/lazy_graph_executor.h>
+#include <torch/csrc/lazy/core/ir.h>
+#include <torch/csrc/lazy/core/tensor.h>
 #include <torch/csrc/lazy/core/metrics.h>
 #include <torch/csrc/lazy/core/multi_wait.h>
 #include <torch/csrc/lazy/core/tensor_impl.h>
@@ -13,6 +15,8 @@
 #include <torch/csrc/lazy/core/thread_pool.h>
 #include <torch/csrc/lazy/core/util.h>
 #include <torch/csrc/lazy/python/python_util.h>
+#include <torch/csrc/lazy/core/internal_ops/ltc_ops.h>
+#include <torch/csrc/lazy/ts_backend/ops/device_data.h>
 
 #include <cstring>
 #include <sstream>
@@ -70,8 +74,8 @@ std::string GetTensorsDump(
   std::vector<torch::lazy::Node*> nodes;
   std::vector<torch::lazy::Value> values;
   for (auto& tensor : tensors) {
-    torch::lazy::LazyTensor xtensor = torch::lazy::TryGetLtcTensor(tensor);
-    values.push_back(xtensor.GetIrValue());
+    torch::lazy::LazyTensorPtr lazy_tensor = torch::lazy::TryGetLtcTensor(tensor);
+    values.push_back(lazy_tensor->GetIrValue());
     nodes.push_back(values.back().node.get());
   }
   return coverter(nodes);
@@ -98,23 +102,23 @@ std::vector<torch::lazy::BackendDevice> GetLtcDevices(const std::vector<std::str
   return ltc_devices;
 }
 
-std::vector<torch::lazy::LazyTensor> GetLtcTensors(const std::vector<at::Tensor>& tensors,
+std::vector<torch::lazy::LazyTensorPtr> GetLtcTensors(const std::vector<at::Tensor>& tensors,
                                       bool want_all) {
-  std::vector<torch::lazy::LazyTensor> xtensors;
-  xtensors.reserve(tensors.size());
+  std::vector<torch::lazy::LazyTensorPtr> lazy_tensors;
+  lazy_tensors.reserve(tensors.size());
   if (want_all) {
     for (auto& tensor : tensors) {
-      xtensors.push_back(torch::lazy::TryGetLtcTensor(tensor));
+      lazy_tensors.push_back(torch::lazy::TryGetLtcTensor(tensor));
     }
   } else {
     for (auto& tensor : tensors) {
-      auto xtensor = torch::lazy::TryGetLtcTensor(tensor);
-      if (xtensor) {
-        xtensors.push_back(xtensor);
+      auto lazy_tensor = torch::lazy::TryGetLtcTensor(tensor);
+      if (lazy_tensor) {
+        lazy_tensors.push_back(lazy_tensor);
       }
     }
   }
-  return xtensors;
+  return lazy_tensors;
 }
 
 AllReduceType GetReduceType(const std::string& reduce_type) {
@@ -157,62 +161,62 @@ std::vector<std::pair<int64_t, int64_t>> CreateSourceTargetPairs(
   return source_target_pairs;
 }
 
-std::shared_ptr<torch::lazy::Value> AllReduceInPlace(
-    const std::string& reduce_type, const std::vector<at::Tensor>& tensors,
-    const std::shared_ptr<torch::lazy::Value>& token, double scale,
-    const std::vector<std::vector<int64_t>>& replica_groups) {
-  std::vector<torch::lazy::LazyTensor> xtensors = GetLtcTensors(tensors, /*want_all=*/true);
-  return std::make_shared<torch::lazy::Value>(
-      lazy_tensor_distributed::all_reduce(&xtensors, *token,
-                                          GetReduceType(reduce_type), scale,
-                                          replica_groups));
-}
+// std::shared_ptr<torch::lazy::Value> AllReduceInPlace(
+//     const std::string& reduce_type, const std::vector<at::Tensor>& tensors,
+//     const std::shared_ptr<torch::lazy::Value>& token, double scale,
+//     const std::vector<std::vector<int64_t>>& replica_groups) {
+//   std::vector<torch::lazy::LazyTensorPtr> lazy_tensors = GetLtcTensors(tensors, /*want_all=*/true);
+//   return std::make_shared<torch::lazy::Value>(
+//       lazy_tensor_distributed::all_reduce(&lazy_tensors, *token,
+//                                           GetReduceType(reduce_type), scale,
+//                                           replica_groups));
+// }
 
-std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>> AllReduce(
-    const std::string& reduce_type, const at::Tensor& input,
-    const std::shared_ptr<torch::lazy::Value>& token, double scale,
-    const std::vector<std::vector<int64_t>>& replica_groups) {
-  torch::lazy::LazyTensor result;
-  torch::lazy::Value new_token;
-  std::tie(result, new_token) = lazy_tensor_distributed::all_reduce(
-      torch::lazy::TryGetLtcTensor(input), *token, GetReduceType(reduce_type), scale,
-      replica_groups);
-  return std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>>(
-      torch::lazy::CreateAtenFromLtcTensor(std::move(result)),
-      std::make_shared<torch::lazy::Value>(new_token));
-}
+// std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>> AllReduce(
+//     const std::string& reduce_type, const at::Tensor& input,
+//     const std::shared_ptr<torch::lazy::Value>& token, double scale,
+//     const std::vector<std::vector<int64_t>>& replica_groups) {
+//   torch::lazy::LazyTensorPtr result;
+//   torch::lazy::Value new_token;
+//   std::tie(result, new_token) = lazy_tensor_distributed::all_reduce(
+//       torch::lazy::TryGetLtcTensor(input), *token, GetReduceType(reduce_type), scale,
+//       replica_groups);
+//   return std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>>(
+//       torch::lazy::CreateAtenFromLtcTensor(std::move(result)),
+//       std::make_shared<torch::lazy::Value>(new_token));
+// }
 
-std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>> AllToAll(
-    const at::Tensor& input, const std::shared_ptr<torch::lazy::Value>& token,
-    int64_t split_dimension, int64_t concat_dimension, int64_t split_count,
-    const std::vector<std::vector<int64_t>>& replica_groups) {
-  torch::lazy::LazyTensor result;
-  torch::lazy::Value new_token;
-  std::tie(result, new_token) = lazy_tensor_distributed::all_to_all(
-      torch::lazy::TryGetLtcTensor(input), *token, split_dimension, concat_dimension,
-      split_count, replica_groups);
-  return std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>>(
-      torch::lazy::CreateAtenFromLtcTensor(std::move(result)),
-      std::make_shared<torch::lazy::Value>(new_token));
-}
+// std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>> AllToAll(
+//     const at::Tensor& input, const std::shared_ptr<torch::lazy::Value>& token,
+//     int64_t split_dimension, int64_t concat_dimension, int64_t split_count,
+//     const std::vector<std::vector<int64_t>>& replica_groups) {
+//   torch::lazy::LazyTensorPtr result;
+//   torch::lazy::Value new_token;
+//   std::tie(result, new_token) = lazy_tensor_distributed::all_to_all(
+//       torch::lazy::TryGetLtcTensor(input), *token, split_dimension, concat_dimension,
+//       split_count, replica_groups);
+//   return std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>>(
+//       torch::lazy::CreateAtenFromLtcTensor(std::move(result)),
+//       std::make_shared<torch::lazy::Value>(new_token));
+// }
 
-std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>> CollectivePermute(
-    const at::Tensor& input, const std::shared_ptr<torch::lazy::Value>& token,
-    const std::vector<std::pair<int64_t, int64_t>>& source_target_pairs) {
-  torch::lazy::LazyTensor result;
-  torch::lazy::Value new_token;
-  std::tie(result, new_token) = lazy_tensor_distributed::collective_permute(
-      torch::lazy::TryGetLtcTensor(input), *token, source_target_pairs);
-  return std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>>(
-      torch::lazy::CreateAtenFromLtcTensor(std::move(result)),
-      std::make_shared<torch::lazy::Value>(new_token));
-}
+// std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>> CollectivePermute(
+//     const at::Tensor& input, const std::shared_ptr<torch::lazy::Value>& token,
+//     const std::vector<std::pair<int64_t, int64_t>>& source_target_pairs) {
+//   torch::lazy::LazyTensorPtr result;
+//   torch::lazy::Value new_token;
+//   std::tie(result, new_token) = lazy_tensor_distributed::collective_permute(
+//       torch::lazy::TryGetLtcTensor(input), *token, source_target_pairs);
+//   return std::pair<at::Tensor, std::shared_ptr<torch::lazy::Value>>(
+//       torch::lazy::CreateAtenFromLtcTensor(std::move(result)),
+//       std::make_shared<torch::lazy::Value>(new_token));
+// }
 
 void SyncTensors(const std::vector<at::Tensor>& tensors,
                  const std::vector<std::string>& devices, bool wait,
                  bool sync_ltc_data) {
-  std::vector<torch::lazy::LazyTensor> xtensors = GetLtcTensors(tensors, /*want_all=*/false);
-  torch::lazy::LazyGraphExecutor::Get()->SyncTensorsGraph(&xtensors, devices, wait,
+  std::vector<torch::lazy::LazyTensorPtr> lazy_tensors = GetLtcTensors(tensors, /*want_all=*/false);
+  torch::lazy::LazyGraphExecutor::Get()->SyncTensorsGraph(&lazy_tensors, devices, wait,
                                              sync_ltc_data);
 }
 
@@ -255,8 +259,8 @@ uint64_t GetRngSeed(const std::string& device_str) {
 }
 
 std::string GetTensorsBackendGraph(const std::vector<at::Tensor>& tensors) {
-  std::vector<torch::lazy::LazyTensor> xtensors = GetLtcTensors(tensors, /*want_all=*/false);
-  return torch::lazy::LazyGraphExecutor::Get()->DumpBackendComputation(xtensors);
+  std::vector<torch::lazy::LazyTensorPtr> lazy_tensors = GetLtcTensors(tensors, /*want_all=*/false);
+  return torch::lazy::LazyGraphExecutor::Get()->DumpBackendComputation(lazy_tensors);
 }
 
 std::string GetLiveTensorsReport(size_t nodes_threshold,
@@ -266,14 +270,14 @@ std::string GetLiveTensorsReport(size_t nodes_threshold,
       opt_device ? &opt_device.value() : nullptr);
   std::stringstream ss;
   for (auto& tensor : tensors) {
-    torch::lazy::Value ir_value = tensor.CurrentIrValue();
+    torch::lazy::Value ir_value = tensor->CurrentIrValue();
     if (ir_value) {
       std::vector<torch::lazy::Node*> roots({ir_value.node.get()});
       auto post_order = torch::lazy::Util::ComputePostOrder(roots);
       if (post_order.size() > nodes_threshold) {
-        ss << "Tensor: id=" << tensor.GetUniqueId()
-           << ", shape=" << tensor.shape().Get()
-           << ", device=" << tensor.GetDevice()
+        ss << "Tensor: id=" << tensor->GetUniqueId()
+           << ", shape=" << tensor->shape().Get()
+           << ", device=" << tensor->GetDevice()
            << ", ir_nodes=" << post_order.size() << "\n";
         for (size_t i = post_order.size(); i > 0; --i) {
           if (!post_order[i - 1]->metadata().frame_info.empty()) {
@@ -290,13 +294,13 @@ std::string GetLiveTensorsReport(size_t nodes_threshold,
 }
 
 std::ptrdiff_t GetTensorViewAliasId(const at::Tensor& tensor) {
-  torch::lazy::LazyTensor xtensor = torch::lazy::TryGetLtcTensor(tensor);
-  return xtensor.GetViewAliasId();
+  torch::lazy::LazyTensorPtr lazy_tensor = torch::lazy::TryGetLtcTensor(tensor);
+  return lazy_tensor->GetViewAliasId();
 }
 
 std::ptrdiff_t GetTensorId(const at::Tensor& tensor) {
-  torch::lazy::LazyTensor xtensor = torch::lazy::TryGetLtcTensor(tensor);
-  return xtensor.GetUniqueId();
+  torch::lazy::LazyTensorPtr lazy_tensor = torch::lazy::TryGetLtcTensor(tensor);
+  return lazy_tensor->GetUniqueId();
 }
 
 std::vector<at::Tensor> GetLtcTensorsFromAten(
@@ -308,7 +312,7 @@ std::vector<at::Tensor> GetLtcTensorsFromAten(
   std::vector<at::Tensor> lazy_tensors;
   lazy_tensors.reserve(data_handles.size());
   for (auto& data_handle : data_handles) {
-    torch::lazy::LazyTensor lazy_tensor = torch::lazy::LazyTensor::Create(std::move(data_handle));
+    torch::lazy::LazyTensorPtr lazy_tensor = torch::lazy::LazyTensor::Create(std::move(data_handle));
     lazy_tensors.push_back(torch::lazy::CreateAtenFromLtcTensor(std::move(lazy_tensor)));
   }
   return lazy_tensors;
@@ -357,41 +361,19 @@ py::object GetRevisions() {
   return py_dict;
 }
 
-py::object LtcNms(const at::Tensor& boxes, const at::Tensor& scores,
-                  const at::Tensor& score_threshold,
-                  const at::Tensor& iou_threshold, int64_t output_size) {
-  at::Tensor selected_indices;
-  at::Tensor num_valid;
-  {
-    NoGilSection nogil;
-    auto nms_result = lazy_tensor_aten_ops::nms(
-        torch::lazy::TryGetLtcTensor(boxes), torch::lazy::TryGetLtcTensor(scores),
-        torch::lazy::TryGetLtcTensor(score_threshold),
-        torch::lazy::TryGetLtcTensor(iou_threshold), output_size);
-    selected_indices = torch::lazy::CreateAtenFromLtcTensor(std::move(nms_result.first));
-    num_valid = torch::lazy::CreateAtenFromLtcTensor(std::move(nms_result.second));
-  }
-  auto result_tuple = py::tuple(2);
-  result_tuple[0] =
-      torch::autograd::make_variable(selected_indices, /*requires_grad=*/false);
-  result_tuple[1] =
-      torch::autograd::make_variable(num_valid, /*requires_grad=*/false);
-  return result_tuple;
-}
-
 std::vector<at::Tensor> LtcCreateTensorList(const at::TensorList& tensors) {
   std::vector<at::Tensor> aten_ltc_tensors(tensors.size());
-  std::vector<torch::lazy::LazyTensor> ltc_tensors;
+  std::vector<torch::lazy::LazyTensorPtr> ltc_tensors;
   // We need to separate out the defined tensors first, torch::lazy::GetLtcTensor() doesn't
   // work with undefined tensors.
   std::vector<bool> to_translate(tensors.size());
   for (size_t i = 0; i < tensors.size(); ++i) {
     const at::Tensor& tensor = tensors[i];
     if (tensor.defined()) {
-      auto xtensor = torch::lazy::TryGetLtcTensor(tensor);
-      if (xtensor) {
+      auto lazy_tensor = torch::lazy::TryGetLtcTensor(tensor);
+      if (lazy_tensor) {
         to_translate[i] = true;
-        ltc_tensors.push_back(xtensor);
+        ltc_tensors.push_back(lazy_tensor);
       } else {
         aten_ltc_tensors[i] = tensor;
       }
@@ -423,14 +405,11 @@ std::vector<at::Tensor> LtcCreateTensorList(const at::TensorList& tensors) {
 //   return py_dict;
 // }
 
+using namespace torch::lazy;
+
 void InitLtcModuleBindings(py::module m) {
   m.def("_prepare_to_exit", []() { PrepareToExit(); });
   m.def("_get_git_revs", []() { return GetRevisions(); });
-  m.def("_ltc_nms", [](const at::Tensor& boxes, const at::Tensor& scores,
-                       const at::Tensor& score_threshold,
-                       const at::Tensor& iou_threshold, int64_t output_size) {
-    return LtcNms(boxes, scores, score_threshold, iou_threshold, output_size);
-  });
   m.def("_get_ltc_tensors_dot",
         [](const std::vector<at::Tensor>& tensors) -> std::string {
           auto coverter = [](c10::ArrayRef<torch::lazy::Node*> nodes) {
@@ -516,83 +495,83 @@ void InitLtcModuleBindings(py::module m) {
     // return replication_devices != nullptr ? replication_devices->size() : 0;
   });
 
-  py::class_<torch::lazy::Value, std::shared_ptr<torch::lazy::Value>>(
-      m, "IrValue");
-  m.def("_ltc_create_token",
-        [](const std::string& device) { return CreateToken(device); });
-  m.def(
-      "_ltc_all_reduce_inplace",
-      [](const std::string& reduce_type, const std::vector<at::Tensor>& tensors,
-         const std::shared_ptr<torch::lazy::Value>& token, double scale,
-         const py::list& groups) {
-        std::vector<std::vector<int64_t>> replica_groups =
-            CreateReduceGroups(groups);
-        std::shared_ptr<torch::lazy::Value> new_token;
-        {
-          NoGilSection nogil;
-          new_token = AllReduceInPlace(reduce_type, tensors, token, scale,
-                                       replica_groups);
-        }
-        return new_token;
-      });
-  m.def("_ltc_all_reduce",
-        [](const std::string& reduce_type, const at::Tensor& input,
-           const std::shared_ptr<torch::lazy::Value>& token, double scale,
-           const py::list& groups) {
-          std::vector<std::vector<int64_t>> replica_groups =
-              CreateReduceGroups(groups);
-          at::Tensor result;
-          std::shared_ptr<torch::lazy::Value> new_token;
-          {
-            NoGilSection nogil;
-            std::tie(result, new_token) =
-                AllReduce(reduce_type, input, token, scale, replica_groups);
-          }
-          auto result_tuple = py::tuple(2);
-          result_tuple[0] = torch::autograd::make_variable(
-              result, /*requires_grad=*/input.requires_grad());
-          result_tuple[1] = new_token;
-          return result_tuple;
-        });
-  m.def("_ltc_all_to_all", [](const at::Tensor& input,
-                              const std::shared_ptr<torch::lazy::Value>& token,
-                              int64_t split_dimension, int64_t concat_dimension,
-                              int64_t split_count, const py::list& groups) {
-    std::vector<std::vector<int64_t>> replica_groups =
-        CreateReduceGroups(groups);
-    at::Tensor result;
-    std::shared_ptr<torch::lazy::Value> new_token;
-    {
-      NoGilSection nogil;
-      std::tie(result, new_token) =
-          AllToAll(input, token, split_dimension, concat_dimension, split_count,
-                   replica_groups);
-    }
-    auto result_tuple = py::tuple(2);
-    result_tuple[0] = torch::autograd::make_variable(
-        result, /*requires_grad=*/input.requires_grad());
-    result_tuple[1] = new_token;
-    return result_tuple;
-  });
-  m.def("_ltc_collective_permute",
-        [](const at::Tensor& input,
-           const std::shared_ptr<torch::lazy::Value>& token,
-           const py::list& pairs) {
-          std::vector<std::pair<int64_t, int64_t>> source_target_pairs =
-              CreateSourceTargetPairs(pairs);
-          at::Tensor result;
-          std::shared_ptr<torch::lazy::Value> new_token;
-          {
-            NoGilSection nogil;
-            std::tie(result, new_token) =
-                CollectivePermute(input, token, source_target_pairs);
-          }
-          auto result_tuple = py::tuple(2);
-          result_tuple[0] = torch::autograd::make_variable(
-              result, /*requires_grad=*/input.requires_grad());
-          result_tuple[1] = new_token;
-          return result_tuple;
-        });
+  // py::class_<torch::lazy::Value, std::shared_ptr<torch::lazy::Value>>(
+  //     m, "IrValue");
+  // m.def("_ltc_create_token",
+  //       [](const std::string& device) { return CreateToken(device); });
+  // m.def(
+  //     "_ltc_all_reduce_inplace",
+  //     [](const std::string& reduce_type, const std::vector<at::Tensor>& tensors,
+  //        const std::shared_ptr<torch::lazy::Value>& token, double scale,
+  //        const py::list& groups) {
+  //       std::vector<std::vector<int64_t>> replica_groups =
+  //           CreateReduceGroups(groups);
+  //       std::shared_ptr<torch::lazy::Value> new_token;
+  //       {
+  //         NoGilSection nogil;
+  //         new_token = AllReduceInPlace(reduce_type, tensors, token, scale,
+  //                                      replica_groups);
+  //       }
+  //       return new_token;
+  //     });
+  // m.def("_ltc_all_reduce",
+  //       [](const std::string& reduce_type, const at::Tensor& input,
+  //          const std::shared_ptr<torch::lazy::Value>& token, double scale,
+  //          const py::list& groups) {
+  //         std::vector<std::vector<int64_t>> replica_groups =
+  //             CreateReduceGroups(groups);
+  //         at::Tensor result;
+  //         std::shared_ptr<torch::lazy::Value> new_token;
+  //         {
+  //           NoGilSection nogil;
+  //           std::tie(result, new_token) =
+  //               AllReduce(reduce_type, input, token, scale, replica_groups);
+  //         }
+  //         auto result_tuple = py::tuple(2);
+  //         result_tuple[0] = torch::autograd::make_variable(
+  //             result, /*requires_grad=*/input.requires_grad());
+  //         result_tuple[1] = new_token;
+  //         return result_tuple;
+  //       });
+  // m.def("_ltc_all_to_all", [](const at::Tensor& input,
+  //                             const std::shared_ptr<torch::lazy::Value>& token,
+  //                             int64_t split_dimension, int64_t concat_dimension,
+  //                             int64_t split_count, const py::list& groups) {
+  //   std::vector<std::vector<int64_t>> replica_groups =
+  //       CreateReduceGroups(groups);
+  //   at::Tensor result;
+  //   std::shared_ptr<torch::lazy::Value> new_token;
+  //   {
+  //     NoGilSection nogil;
+  //     std::tie(result, new_token) =
+  //         AllToAll(input, token, split_dimension, concat_dimension, split_count,
+  //                  replica_groups);
+  //   }
+  //   auto result_tuple = py::tuple(2);
+  //   result_tuple[0] = torch::autograd::make_variable(
+  //       result, /*requires_grad=*/input.requires_grad());
+  //   result_tuple[1] = new_token;
+  //   return result_tuple;
+  // });
+  // m.def("_ltc_collective_permute",
+  //       [](const at::Tensor& input,
+  //          const std::shared_ptr<torch::lazy::Value>& token,
+  //          const py::list& pairs) {
+  //         std::vector<std::pair<int64_t, int64_t>> source_target_pairs =
+  //             CreateSourceTargetPairs(pairs);
+  //         at::Tensor result;
+  //         std::shared_ptr<torch::lazy::Value> new_token;
+  //         {
+  //           NoGilSection nogil;
+  //           std::tie(result, new_token) =
+  //               CollectivePermute(input, token, source_target_pairs);
+  //         }
+  //         auto result_tuple = py::tuple(2);
+  //         result_tuple[0] = torch::autograd::make_variable(
+  //             result, /*requires_grad=*/input.requires_grad());
+  //         result_tuple[1] = new_token;
+  //         return result_tuple;
+  //       });
   m.def("_ltc_set_default_device", [](const std::string& device) {
     // TODO: Replace this API with _ltc_set_default_device_type.
     // The reasons why deprecating this API are that:
@@ -686,6 +665,81 @@ void InitLtcModuleBindings(py::module m) {
   });
   m.def("_ltc_enable_thread_pool", []() {
     FLAGS_torch_lazy_use_thread_pool = true;
+  });
+  /*
+   * Return tensor ids and tensors for DeviceData nodes.
+   * TODO(shunting) revisit this API for XLA
+   */
+  m.def("_get_ltc_tensors_ts_device_data_node",
+        [](const std::vector<at::Tensor>& tensors) {
+          std::vector<Node*> roots;
+          for (auto& tensor : tensors) {
+            auto xtensor = TryGetLtcTensor(tensor);
+            roots.push_back(xtensor->GetIrValue().node.get());
+          }
+          auto post_order = Util::ComputePostOrder(roots);
+          std::vector<int64_t> tensor_ids;
+          std::vector<at::IValue> ivalues;
+
+          std::unordered_set<BackendData::Handle> data_handles_;
+          for (auto nodeptr : post_order) {
+            if (nodeptr->op() == *torch::lazy::ltc_device_data) {
+              const auto* device_data_node = torch::lazy::NodeCast<torch::lazy::DeviceData>(nodeptr, *torch::lazy::ltc_device_data);
+
+              auto infoptr = device_data_node->data()->info();
+              auto deviceDataInfoPtr = (torch::lazy::LazyGraphExecutor::DeviceDataInfo*) infoptr;
+              auto* tsDataPtr = (torch_lazy_tensors::compiler::TSData*) device_data_node->data().get();
+
+              // dedup DeviceData by handle
+              auto handle = tsDataPtr->GetHandle();
+              if (!data_handles_.insert(handle).second) {
+                continue;
+              }
+              tensor_ids.push_back(deviceDataInfoPtr->tensor_id);
+              /*
+               * If the TSData contains a tensor, then the tensor id will uniquely identify the tensor.
+               * We use that tensor id to find the tensor in other places: e.g. in the python forward method parameters.
+               *
+               * If the TSData contains a scalar, the tensor id itself is not important. We reuse the scalar value in
+               * future calls.
+               */
+              if (tsDataPtr->HasValue()) {
+                ivalues.push_back(tsDataPtr->data());
+              } else {
+                CHECK(tsDataPtr->scalar.has_value());
+                ivalues.push_back(tsDataPtr->scalar.value());
+              }
+            }
+          }
+          return std::make_pair(tensor_ids, ivalues);
+        });
+  m.def("_get_graph_hash", [](const std::vector<at::Tensor>& tensors) {
+    std::vector<LazyTensorPtr> xtensors;
+    for (auto& tensor : tensors) {
+      xtensors.push_back(TryGetLtcTensor(tensor));
+    }
+    auto hash = LazyGraphExecutor::Get()->GetGraphHash(xtensors);
+    std::string bin((const char*) &hash, sizeof(hash));
+    return py::bytes(bin);
+  });
+  // TODO(shunting) revisit this part for XLA
+  m.def("_run_cached_graph", [](const std::string& hash_str, const std::vector<at::IValue>& graph_inputs) {
+    TORCH_CHECK(hash_str.size() == sizeof(hash_t));
+    hash_t hash = *(hash_t*) (hash_str.c_str());
+    auto cachedComputation = LazyGraphExecutor::Get()->GetComputationCache()->Get(hash);
+    TORCH_CHECK(cachedComputation, "Failed to get computation by hash. Maybe the entry get kicked out of the LRU cache"); // TODO implement a fallback mechanism, or make sure those entries never get kicked out
+    auto computationPtr = (torch::lazy::TSComputation*) cachedComputation->computation.get();
+
+    std::vector<torch::jit::IValue> stack;
+    for (auto arg : graph_inputs) {
+      stack.emplace_back(arg);
+    }
+    computationPtr->graph_executor().run(stack);
+    std::vector<at::Tensor> result;
+    for (torch::jit::IValue elem : stack) {
+      result.push_back(elem.toTensor());
+    }
+    return result;
   });
 }  // namespace
 

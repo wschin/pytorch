@@ -12,7 +12,7 @@ namespace lazy {
 class TestLeafNode : public Node {
  public:
   explicit TestLeafNode(size_t param)
-      : Node(OpKind(), /* num_outputs */ 1, [&](bool /*unused*/) { return Hash(param); }),
+      : Node(OpKind(), /* num_outputs */ 1, /* hash_func */[&](bool /*bakeInSizes*/) -> hash_t { return Hash(param); }),
         param_(param) {}
   ~TestLeafNode() override = default;
 
@@ -23,9 +23,11 @@ class TestLeafNode : public Node {
   const Output& operand(size_t i) const override {
     TORCH_INTERNAL_ASSERT(false, "Can't access operand[i] of leaf node");
   }
-
+  const Shape& shape(size_t i) const override { return shape_; }
+  c10::ArrayRef<Shape> shapes() const override { return {shape_}; }
  private:
   size_t param_;
+  Shape shape_;
 };
 
 TEST(IrTest, BasicTest) {

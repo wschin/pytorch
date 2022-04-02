@@ -8,6 +8,7 @@ on:
 
 jobs:
   quick-checks:
+    name: quick-checks
     runs-on: ubuntu-18.04
     steps:
       - name: Setup Python
@@ -17,6 +18,10 @@ jobs:
           architecture: x64
       - name: Checkout PyTorch
         uses: zhouzhuojie/checkout@05b13c9a0d21f08f6d5e64a1d5042246d13619d9
+      - name: Clean PyTorch checkout
+        run: |
+          # Remove any artifacts from the previous checkouts
+          git clean -fxd
       - name: Install requirements
         id: requirements
         run: pip3 install -r requirements.txt --user
@@ -109,6 +114,7 @@ jobs:
           .github/scripts/lint_test_ownership.py
 
   clang-format:
+    name: clang-format
     runs-on: ubuntu-18.04
     if: ${{ github.event_name == 'pull_request' }}
     steps:
@@ -149,6 +155,7 @@ jobs:
           exit 1
 
   py2-setup-validate-errormsg:
+    name: py2-setup-validate-errormsg
     runs-on: ubuntu-18.04
     steps:
       - name: Setup Python
@@ -168,6 +175,7 @@ jobs:
         run: python2 -m py_compile torch/utils/collect_env.py
 
   shellcheck:
+    name: shellcheck
     runs-on: ubuntu-18.04
     steps:
       - name: Setup Python
@@ -247,6 +255,7 @@ jobs:
           rm actionlint
 
   toc:
+    name: toc
     runs-on: ubuntu-18.04
     # https://github.com/actions/virtual-environments/issues/599#issuecomment-602754687
     env:
@@ -283,6 +292,7 @@ jobs:
           fi
 
   flake8-py3:
+    name: flake8-py3
     runs-on: ubuntu-18.04
     steps:
       - name: Setup Python
@@ -343,11 +353,16 @@ jobs:
           mode: json
 
   clang-tidy:
+    name: clang-tidy
     runs-on: linux.2xlarge
     container:
       # ubuntu20.04-cuda11.2-py3.8-tidy11
       image: ghcr.io/pytorch/cilint-clang-tidy:d8f0c777964d0dd8a147360de80aed1a13eb613a
     steps:
+      - name: Clean workspace
+        run: |
+          rm -rf "${GITHUB_WORKSPACE}"
+          mkdir "${GITHUB_WORKSPACE}"
       - name: Checkout PyTorch
         uses: zhouzhuojie/checkout@05b13c9a0d21f08f6d5e64a1d5042246d13619d9
         with:
@@ -432,6 +447,7 @@ jobs:
           mode: json
 
   cmakelint:
+    name: cmakelint
     runs-on: ubuntu-18.04
     steps:
       - name: Setup Python
@@ -454,6 +470,7 @@ jobs:
           xargs -0 cmakelint --config=.cmakelintrc --spaces=2 --quiet
 
   mypy:
+    name: mypy
     runs-on: ubuntu-18.04
     steps:
       - name: Setup Python
