@@ -79,22 +79,95 @@ def reshape_as(g, self, other):
     return reshape(g, self, shape)
 
 
-def add(g, self, other, alpha=None):
-    if symbolic_helper._is_value(self) and symbolic_helper._is_tensor_list(self):
-        return symbolic_helper._onnx_opset_unsupported_detailed(
-            "Add", 9, 11, "Add between list of tensors not supported"
-        )
+#def add(g, self, other, alpha=None):
+#    if symbolic_helper._is_value(self) and symbolic_helper._is_tensor_list(self):
+#        return symbolic_helper._onnx_opset_unsupported_detailed("Add", 9, 11, "Add between list of tensors not supported")
+#
+#    # default alpha arg is to allow no-alpha add (aten add st overload no alpha)
+#    if alpha and symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
+#        return _unimplemented("add", "alpha != 1")
+#    return g.op("Add", self, other)
+#
+#
+#def sub(g, self, other, alpha=None):
+#    # default alpha arg is to allow no-alpha sub (aten sub st overload no alpha)
+#    if alpha and symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
+#        return _unimplemented("sub", "alpha != 1")
+#    return g.op("Sub", self, other)
 
+def find_cast_target_type(g, self, other):
+    target_type = None
+    self_type = symbolic_helper._try_get_scalar_type(self)
+    other_type = symbolic_helper._try_get_scalar_type(other)
+    if self_type == other_type:
+      target_type = self_type
+    elif self_type == 'Float' and other_type == 'Double':
+      target_type = 'Double'
+    elif self_type == 'Double' and other_type == 'Float':
+      target_type = 'Double'
+    elif self_type and not other_type:
+      target_type = self_type
+    elif other_type and not self_type:
+      target_type = other_type
     # default alpha arg is to allow no-alpha add (aten add st overload no alpha)
-    if alpha and symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
+    def is_good_tensor(value):
+      return symbolic_helper._is_tensor(value) and symbolic_helper._get_tensor_rank(value) > 0
+    def is_bad_tensor(value):
+      return symbolic_helper._is_tensor(value) and symbolic_helper._get_tensor_rank(value) == 0
+    if is_good_tensor(self) and is_bad_tensor(other):
+      target_type = self_type
+    elif is_good_tensor(other) and is_bad_tensor(self):
+      target_type = other_type
+    
+
+    if target_type and target_type != self_type:
+      casted_self = g.op("Cast", self, to_i=symbolic_helper.cast_pytorch_to_onnx[target_type])
+    else:
+      casted_self = self
+
+    if target_type and target_type != other_type:
+      casted_other = g.op("Cast", other, to_i=symbolic_helper.cast_pytorch_to_onnx[target_type])
+    else:
+      casted_other = other
+
+    return target_type, casted_self, casted_other
+
+def add(g, self, other, alpha=None):
+    #if symbolic_helper._is_value(self) and symbolic_helper._is_tensor_list(self):
+    #    return symbolic_helper._onnx_opset_unsupported_detailed(
+    #        "Add", 9, 11, "Add between list of tensors not supported"
+    #    )
+
+    ## default alpha arg is to allow no-alpha add (aten add st overload no alpha)
+    #print(alpha)
+    #if alpha and symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
+    #    return symbolic_helper._unimplemented("add", "alpha != 1")
+    if symbolic_helper._is_value(self) and symbolic_helper._is_tensor_list(self):
+        return symbolic_helper._onnx_opset_unsupported_detailed("Add", 9, 11, "Add between list of tensors not supported")
+    
+    target_type, self, other = find_cast_target_type(g, self, other)
+
+    if alpha:
+      if symbolic_helper._is_value(alpha):
+        alpha = g.op("Cast", alpha, to_i=symbolic_helper.cast_pytorch_to_onnx[target_type])
+        other = g.op("Mul", other, alpha)
+      elif symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
         return symbolic_helper._unimplemented("add", "alpha != 1")
+
     return g.op("Add", self, other)
 
 
 def sub(g, self, other, alpha=None):
+    target_type, self, other = find_cast_target_type(g, self, other)
     # default alpha arg is to allow no-alpha sub (aten sub st overload no alpha)
-    if alpha and symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
-        return symbolic_helper._unimplemented("sub", "alpha != 1")
+    #if alpha and symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
+    #    return symbolic_helper._unimplemented("sub", "alpha != 1")
+    if alpha:
+      if symbolic_helper._is_value(alpha):
+        alpha_casted = g.op("Cast", alpha, to_i=symbolic_helper.cast_pytorch_to_onnx[target_type])
+        other = g.op("Mul", other, alpha_casted)
+      elif symbolic_helper._scalar(symbolic_helper._maybe_get_scalar(alpha)) != 1:
+        return symbolic_helper._unimplemented("add", "alpha != 1")
     return g.op("Sub", self, other)
 
 
@@ -103,7 +176,11 @@ def rsub(g, self, other, alpha=None):
 
 
 def mul(g, self, other):
-    return g.op("Mul", self, other)
+    if symbolic_helper._is_bool(self):
+      return g.op("And", self, other)
+    else:
+      return g.op("Mul", self, other)
+
 
 
 def div(g, self, other, *args):
@@ -1624,6 +1701,12 @@ def where(g, condition, self=None, other=None, _outputs=None):
     return g.op("Where", condition, self, other)
 
 
+@symbolic_helper.parse_args("v", "i", "i")
+def _log_softmax(g, input, dim, half_to_float):
+    # TODO: Handle half_to_float.
+    return log_softmax(g, input, dim)
+
+
 @symbolic_helper.parse_args("v", "i", "none")
 def log_softmax(g, input, dim, dtype=None):
     # PyTorch dim and ONNX axis have different meanings.
@@ -1721,6 +1804,11 @@ def _convolution(
         return g.op("Add", n, bias)
     else:
         return n
+
+
+@symbolic_helper.parse_args("v", "v", "v", "is", "is", "is", "i", "is", "i")
+def convolution(g, input, weight, bias, stride, padding, dilation, transposed, output_padding, groups):
+    return _convolution(g, input, weight, bias, stride, padding, dilation, transposed, output_padding, groups, None, None, None, None)
 
 
 @symbolic_helper.parse_args("v", "v", "v", "is", "is", "is", "i")
@@ -1937,6 +2025,10 @@ def layer_norm(g, input, normalized_shape, weight, bias, eps, cudnn_enable):
 
     return layer_norm
 
+
+@symbolic_helper.parse_args("v", "is", "v", "v", "f")
+def native_layer_norm(g, input, normalized_shape, weight, bias, eps):
+    return layer_norm(g, input, normalized_shape, weight, bias, eps, False)
 
 @symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "f", "f", "i")
 def instance_norm(

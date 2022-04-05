@@ -536,6 +536,18 @@ def _is_fp(value):
             return type in ("Float", "Double", "Half", "BFloat16")
     return False
 
+def _is_bool(value):
+    if value:
+        if isinstance(value, torch.Tensor):
+            type = value.dtype
+            return type == "torch.bool"
+        else:
+            type = value.type().scalarType()
+            if type is None:
+                warnings.warn("Type cannot be inferred, which might cause exported graph to produce incorrect results.")
+            return type == "Bool"
+    return False
+
 
 def _generate_wrapped_number(g, scalar):
     """Creates a wrapped number based on https://github.com/pytorch/pytorch/issues/9515.
