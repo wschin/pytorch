@@ -469,7 +469,6 @@ void ProfilingGraphExecutorImpl::runProfilingOptimizations(
     runNooptPassPipeline(copy);
     return;
   }
-
   runPreAutodiffPassPipeline(copy);
 
   if (needsGradientInProfilingMode(copy->block())) {
@@ -527,6 +526,7 @@ void ProfilingGraphExecutorImpl::runProfilingInsensitiveOptimizations(
   if (getGraphExecutorOptimize()) {
     Inline(*graph);
   }
+  runNoGradOptimizations(graph, 4);
   GRAPH_DEBUG("After inlining, before ClearProfilingInformation\n", *graph);
   ClearProfilingInformation(graph);
   GRAPH_DEBUG("After ClearProfilingInformation, before LowerGradOf\n", *graph);
