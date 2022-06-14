@@ -342,12 +342,12 @@ def bmm(g, self, other):
 def matmul(g, self, other):
     return g.op("MatMul", self, other)
 
-@parse_args("v", "v", "v", "i", "i")
+@symbolic_helper.parse_args("v", "v", "v", "i", "i")
 def addmm(g, self, mat1, mat2, beta, alpha):
     dtype = None
-    self_dtype = sym_help._try_get_scalar_type(self)
-    mat1_dtype = sym_help._try_get_scalar_type(mat1)
-    mat2_dtype = sym_help._try_get_scalar_type(mat2)
+    self_dtype = symbolic_helper._try_get_scalar_type(self)
+    mat1_dtype = symbolic_helper._try_get_scalar_type(mat1)
+    mat2_dtype = symbolic_helper._try_get_scalar_type(mat2)
     if self_dtype is not None:
         dtype = self_dtype
     elif mat1_dtype is not None:
@@ -355,21 +355,21 @@ def addmm(g, self, mat1, mat2, beta, alpha):
     elif mat2_dtype is not None:
         dtype = mat2_dtype
 
-    mat1_rank = sym_help._get_tensor_rank(mat1)
-    mat2_rank = sym_help._get_tensor_rank(mat2)
+    mat1_rank = symbolic_helper._get_tensor_rank(mat1)
+    mat2_rank = symbolic_helper._get_tensor_rank(mat2)
 
     def isNotNoneAnd(v, u):
         return v is not None and v != u
 
     if dtype is not None and (isNotNoneAnd(mat1_rank, 2) or isNotNoneAnd(mat2_rank, 2)):
-        dtype = sym_help.scalar_type_to_onnx.index(sym_help.cast_pytorch_to_onnx[dtype])
-        dtype = sym_help.scalar_type_to_pytorch_type[dtype]
+        dtype = symbolic_helper.scalar_type_to_onnx.index(symbolic_helper.cast_pytorch_to_onnx[dtype])
+        dtype = symbolic_helper.scalar_type_to_pytorch_type[dtype]
 
         res1 = g.op("MatMul", mat1, mat2)
         res2 = self
 
-        alpha = sym_help._scalar(alpha)
-        beta = sym_help._scalar(beta)
+        alpha = symbolic_helper._scalar(alpha)
+        beta = symbolic_helper._scalar(beta)
 
         if alpha != 1:
             alpha = g.op("Constant",
@@ -377,12 +377,12 @@ def addmm(g, self, mat1, mat2, beta, alpha):
             res1 = g.op("Mul", res1, alpha)
         if beta != 1:
             beta = g.op("Constant",
-                        value_t=torch.tensor(sym_help._scalar(beta), dtype=dtype))
+                        value_t=torch.tensor(symbolic_helper._scalar(beta), dtype=dtype))
             res2 = g.op("Mul", res2, beta)
 
         return g.op("Add", res1, res2)
 
-    return g.op("Gemm", mat1, mat2, self, beta_f=sym_help._scalar(beta), alpha_f=sym_help._scalar(alpha))
+    return g.op("Gemm", mat1, mat2, self, beta_f=symbolic_helper._scalar(beta), alpha_f=symbolic_helper._scalar(alpha))
 
 @symbolic_helper.parse_args("v", "v", "v", "t", "t")
 def addmm(g, self, mat1, mat2, beta, alpha):
@@ -2069,14 +2069,14 @@ def layer_norm(g, input, normalized_shape, weight, bias, eps, cudnn_enable):
 
 @symbolic_helper.parse_args("v", "is", "v", "v", "f")
 def native_layer_norm(g, input, normalized_shape, weight, bias, eps):
-    if sym_help._operator_export_type == torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK:
+    if  GLOBALS.operator_export_type == torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK:
         return g.at("layer_norm", input, weight, bias, normalized_shape_i=normalized_shape,
                     eps_f=eps, cudnn_enable_i=False)
 
     axes = [-i for i in range(len(normalized_shape), 0, -1)]
 
-    two_cst = sym_help._generate_wrapped_number(g, 2.)
-    eps_cst = sym_help._generate_wrapped_number(g, eps)
+    two_cst = symbolic_helper._generate_wrapped_number(g, 2.)
+    eps_cst = symbolic_helper._generate_wrapped_number(g, eps)
 
     mean = g.op("ReduceMean", input, axes_i=axes)
     numerator = sub(g, input, mean)
@@ -2086,16 +2086,15 @@ def native_layer_norm(g, input, normalized_shape, weight, bias, eps):
 
     layer_norm = g.op("Div", numerator, denominator)
 
-    if not (weight is None or sym_help._is_none(weight)):
+    if not (weight is None or symbolic_helper._is_none(weight)):
         layer_norm = mul(g, layer_norm, weight)
-    if not (bias is None or sym_help._is_none(bias)):
+    if not (bias is None or symbolic_helper._is_none(bias)):
         layer_norm = add(g, layer_norm, bias)
 
     return layer_norm, mean, variance
 
 
-@parse_args("v", "v", "v", "v", "v", "i", "f", "f", "i")
->>>>>>> Add new exporters
+@symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "f", "f", "i")
 def instance_norm(
     g,
     input,
