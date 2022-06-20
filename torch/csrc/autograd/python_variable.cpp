@@ -34,6 +34,7 @@
 #include <torch/csrc/utils/tensor_new.h>
 
 #include <torch/csrc/jit/python/pybind_utils.h>
+#include <torch/csrc/utils/torch_dispatch_mode.h>
 #include <torch/library.h>
 
 #include <ATen/ATen.h>
@@ -251,6 +252,9 @@ int64_t concrete_dim_fn(
 c10::IntArrayRef concrete_strides_fn(
     const c10::impl::PyInterpreter*,
     const c10::TensorImpl* self);
+c10::IntArrayRef concrete_sizes_fn(
+    const c10::impl::PyInterpreter*,
+    const c10::TensorImpl* self);
 
 class PyInterpreterHolder {
  public:
@@ -263,7 +267,8 @@ class PyInterpreterHolder {
             &concrete_is_contiguous_fn,
             &concrete_device_fn,
             &concrete_dim_fn,
-            &concrete_strides_fn)) {}
+            &concrete_strides_fn,
+            &concrete_sizes_fn)) {}
   // NB: intentionally leaks the memory
   ~PyInterpreterHolder() {
     impl_->disarm();
@@ -612,6 +617,7 @@ static PyObject* THPVariable_make_subclass(
     throw torch::TypeError(
         "cls must be a type (got %s)", Py_TYPE(cls)->tp_name);
   }
+  torch_dispatch_mode::StashTorchDispatchModeGuard td_g;
   auto data =
       r.tensor(1).detach(); // creates a fresh Tensor (DEFINITELY_UNINITIALIZED)
   // We set `data`'s `allow_tensor_metadata_change` to true here, because we
@@ -2279,7 +2285,49 @@ c10::IntArrayRef concrete_strides_fn(
   py::object os = py::module_::import("torch").attr("overrides");
   py::function get_buffer =
       py::reinterpret_borrow<py::function>(os.attr("get_buffer"));
-  auto buffer = get_buffer(sub, values);
+  auto buffer = get_buffer(sub, values, "stride");
+  auto result = THPUtils_unpackLongs(buffer.ptr());
+  int64_t* start = (int64_t*)result[0];
+  int64_t len = result[1];
+
+  return c10::IntArrayRef(start, len);
+}
+
+c10::IntArrayRef concrete_sizes_fn(
+    const c10::impl::PyInterpreter*,
+    const c10::TensorImpl* self) {
+  pybind11::gil_scoped_acquire gil;
+  at::impl::MaybeSetTLSOnEntryGuard guard;
+
+  auto out = torchDispatchFromTensorImpl(
+      self,
+      "size",
+      py::module::import("torch")
+          .attr("ops")
+          .attr("aten")
+          .attr("size")
+          .attr("default")
+          .ptr(),
+      "torch.ops.aten");
+
+  if (out == Py_None) {
+    return self->sizes_default();
+  }
+
+  py::object values = py::reinterpret_steal<py::object>(out.ptr());
+
+  c10::TensorImpl* ptr = const_cast<c10::TensorImpl*>(self);
+  c10::optional<PyObject*> mb_obj = ptr->check_pyobj(getPyInterpreter());
+  TORCH_CHECK(
+      mb_obj.has_value(), "Tensor subclass's PyInterpreter has no value");
+  PyObject* subclass = *mb_obj;
+  Py_INCREF(subclass);
+  py::object sub = py::reinterpret_steal<py::object>(subclass);
+
+  py::object os = py::module_::import("torch").attr("overrides");
+  py::function get_buffer =
+      py::reinterpret_borrow<py::function>(os.attr("get_buffer"));
+  auto buffer = get_buffer(sub, values, "size");
   auto result = THPUtils_unpackLongs(buffer.ptr());
   int64_t* start = (int64_t*)result[0];
   int64_t len = result[1];
