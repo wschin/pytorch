@@ -48,6 +48,13 @@ def fuser(name):
         torch._C._jit_override_can_fuse_on_gpu(False)
         torch._C._jit_set_texpr_fuser_enabled(False)
         torch._C._jit_set_nvfuser_enabled(True)
+    elif name == 'fuser3':
+        torch._C._jit_override_can_fuse_on_cpu(False)
+        torch._C._jit_override_can_fuse_on_gpu(False)
+        torch._C._jit_set_texpr_fuser_enabled(False)
+        torch._C._jit_set_nvfuser_enabled(False)
+        #from onnxruntime.capi import _pybind_state as C
+        #C.register_ort_as_torch_jit_executor()
     else:
         raise Exception("unrecognized fuser option")
     try:
