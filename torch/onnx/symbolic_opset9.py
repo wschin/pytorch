@@ -2007,6 +2007,37 @@ def _convolution(
         return n
 
 
+@symbolic_helper.parse_args("v", "v", "v", "is", "is", "is", "i", "is", "i")
+def convolution(
+    g,
+    input,
+    weight,
+    bias,
+    stride,
+    padding,
+    dilation,
+    transposed,
+    output_padding,
+    groups,
+):
+    return _convolution(
+        g,
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
 @symbolic_helper.parse_args("v", "v", "v", "is", "is", "is", "i")
 def conv1d(g, input, weight, bias, stride, padding, dilation, groups):
     return _convolution(
