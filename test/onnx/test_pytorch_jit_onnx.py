@@ -79,7 +79,7 @@ class _TestJITIRToONNX:
         self.run_test(graph_ir, (a, b))
 
     def test_add_sub_with_graph_inputs(self):
-        for op in ['add', 'sub', 'rsub']:
+        for op in ["add", "sub", "rsub"]:
             graph_ir = f"""
             graph(%1 : Float(2, 3),
                   %2 : Float(2, 3),
@@ -90,6 +90,7 @@ class _TestJITIRToONNX:
             a = torch.randn(2, 3)
             b = torch.randn(2, 3)
             self.run_test(graph_ir, (a, b, 2))
+
 
 def MakeTestCase(opset_version: int) -> type:
     name = f"TestJITIRToONNX_opset{opset_version}"
