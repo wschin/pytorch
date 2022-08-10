@@ -339,12 +339,30 @@ def run_onnx_session(sess, input_names, inputs, output_names, outputs):
             value.size(),
             value.data_ptr(),
         )
-    for name, value in zip(output_names, outputs):
-        binding.bind_output(
-            name
+
+    allocated_outputs = tuple(
+        torch.empty(
+            t.shape,
+            dtype=t.dtype,
+            layout=t.layout,
+            device=t.device,
+            requires_grad=t.requires_grad,
         )
+        for t in outputs
+    )
+    for name, value in zip(output_names, allocated_outputs):
+        dev = value.device
+        binding.bind_output(
+            name,
+            dev.type,
+            dev.index or 0,
+            _NP_DTYPE[value.dtype],
+            value.size(),
+            value.data_ptr(),
+        )
+
     sess.run_with_iobinding(binding)
-    return tuple(value.numpy() for value in binding.get_outputs())
+    return allocated_outputs
 
 class OrtBackend:
     def __init__(self):
