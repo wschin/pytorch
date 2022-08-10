@@ -489,134 +489,10 @@ class OrtBackend:
             raise RuntimeError(f"Shape mismatch")
         return nvfuser_outputs
 
-        if graph_module in self.prim_decomp_cache:
-            logging.debug("prim_decomp_cache hit!")
-            prim_module = self.prim_decomp_cache[graph_module]
-        else:
-            prim_graph = torch.fx.Graph()
-            expected_outputs = DecompositionInterpreter(graph_module, prim_graph, decomposition_table=aten2prim_decomp).run(*args, **kwargs)
-            prim_module = torch.fx.GraphModule(graph_module, prim_graph)
-            #print("prim_module begin")
-            #prim_module.graph.print_tabular()
-            #print("prim_module begin end")
-            #duplicated_module = torch.fx.symbolic_trace(graph_module)
-            self.prim_decomp_cache[graph_module] = prim_module
-            self.expected_outputs[graph_module] = expected_outputs
-
-            logging.debug("Lower to prims graph: ", prim_module.code)
-
-            #for t in args:
-            #    print("PTH in: ", t.device, t.shape, t.dtype, t.layout)
-            #for t in expected_outputs:
-            #    print("PTH out: ", t.device, t.shape, t.dtype, t.layout)
-
-            ## Consider using prim module
-            #modified_module = duplicated_module
-            #self.ort_module_cache[graph_module] = graph_module
-            #from torch.fx.passes.fake_tensor_prop import FakeTensorProp
-            #from torch._subclasses.fake_tensor import (
-            #    FakeTensor,
-            #    FakeTensorMode,
-            #)
-
-
-            #print('JIT graph:')
-            #f = fx_to_torchscript(modified_module)
-            #print(f.graph)
-
-            #def decoreate_torchscript(script_module, expected_outputs):
-            #    for i, v in enumerate(script_module.graph.inputs()):
-            #        if v.debugName() == "self":
-            #            f.graph.eraseInput(i)
-            #            break
-            #    for i, input in enumerate(script_module.graph.inputs()):
-            #        input.setType(torch._C.TensorType.create_from_tensor(args[i]))
-            #    for i, output in enumerate(script_module.graph.outputs()):
-            #        output.setType(torch._C.TensorType.create_from_tensor(expected_outputs[i]))
-
-            #decoreate_torchscript(f, self.expected_outputs[graph_module])
-
-            #import onnxruntime
-            #onnx_proto = _jit_graph_to_onnx_model(f.graph, torch.onnx.OperatorExportTypes.ONNX, 14)
-            #import onnx
-            #onnx.save(onnx_proto, '/tmp/onnx_model.onnx')
-            #m = onnx.load('/tmp/onnx_model.onnx')
-            #print(m)
-            #onnx.checker.check_model(m)
-            ##import pdb; pdb.set_trace()
-            #ort_sess = onnxruntime.InferenceSession(onnx_proto, providers=["CPUExecutionProvider", "CUDAExecutionProvider"])
-            #import numpy as np
-            #_NP_DTYPE = {
-            #    torch.float16: np.float16,
-            #    torch.float32: np.float32,
-            #    torch.float64: np.float64,
-            #    torch.uint8: np.uint8,
-            #    torch.int8: np.int8,
-            #    torch.int16: np.int16,
-            #    torch.int32: np.int32,
-            #    torch.int64: np.longlong,
-            #    torch.bool: np.bool_,
-            #}
-            #binding = ort_sess.io_binding()
-            #args = [a.contiguous() for a in args]
-            #for jit_input, value in zip(f.graph.inputs(), args):
-            #    dev = value.device
-            #    binding.bind_input(
-            #        jit_input.debugName(),
-            #        dev.type,
-            #        dev.index or 0,
-            #        _NP_DTYPE[value.dtype],
-            #        value.size(),
-            #        value.data_ptr(),
-            #    )
-
-            #outputs = [
-            #    torch.empty(
-            #        t.shape,
-            #        dtype=t.dtype,
-            #        layout=t.layout,
-            #        device=t.device,
-            #        requires_grad=t.requires_grad,
-            #    )
-            #    for t in self.expected_outputs[graph_module]
-            #]
-
-            ##for o, value in zip(m.graph.output, outputs):
-            ##    dev = value.device
-            ##    binding.bind_output(
-            ##        o.name,
-            ##        dev.type,
-            ##        dev.index or 0,
-            ##        _NP_DTYPE[value.dtype],
-            ##        value.size(),
-            ##        value.data_ptr(),
-            ##    )
-
-            #for onnx_output in m.graph.output:
-            #    binding.bind_output(
-            #        onnx_output.name
-            #    )
-            #print('ORT run')
-            ##import pdb; pdb.set_trace()
-            #ort_sess.run_with_iobinding(binding)
-            #for ort_output in binding.get_outputs():
-            #  np_output = ort_output.numpy()
-            #  print(f'[ORT output] shape: {np_output.shape}, dtype: {np_output.dtype}')
-                
-
-        # invokes trace executor for running the prim graph
-        #print('My args: ', (type(i) for i in args))
-        #return ort_module(*args)
-        print("prim_module final")
-        prim_module.graph.print_tabular()
-        print("prim_module final end")
-        return execute(prim_graph, *args, executor="aten")
-
     def compile(self, graph_module: GraphModule, args) -> GraphModule:
         # entry function for nvFuser backend
         logging.debug("Compiling graph_module: ", graph_module.code)
         print("Compiling graph_module: ", graph_module.code)
-
 
         # FX graph based partitioning based on nvfuser supported ops
         if graph_module in self.partitioner_cache:
@@ -625,19 +501,9 @@ class OrtBackend:
         else:
             partitioner = CapabilityBasedPartitioner(
                 graph_module, self.supported_ops, allows_single_node_partition=False)
-            #import pdb; pdb.set_trace()
             fused_graph_module = partitioner.partition_and_fuse()
             from torch.fx.passes.fake_tensor_prop import FakeTensorProp
             FakeTensorProp(fused_graph_module).propagate(*args)
-
-            #print('meta-------------------------------')
-            #print(fused_graph_module.code)
-            #for node in fused_graph_module.graph.nodes:
-            #    if hasattr(node, 'meta'):
-            #        print("Tensor: ", node.name, node.meta)
-            #    else:
-            #        print("Tensor: ", node.name, " no meta.")
-
             self.partitioner_cache[graph_module] = fused_graph_module
 
         print("Compiling fused_graph_module: ", fused_graph_module.code)
@@ -651,36 +517,4 @@ class OrtBackend:
         return fused_graph_module
 
     def __call__(self, graph_module: GraphModule, args) -> GraphModule:
-        # wrap self.compile as __call__ function to fit the interface for AOTAutograd's fw_compiler
-        #from torch.fx.passes.fake_tensor_prop import FakeTensorProp
-        #from torch._subclasses.fake_tensor import (
-        #    FakeTensor,
-        #    FakeTensorMode,
-        #)
-        #FakeTensorProp(graph_module).propagate(*args)
-
-        #print('Fake result')
-        #print([n.meta['fake_result'] for n in graph_module.graph.nodes])
-        #print('FakeProp')
-        #print(graph_module.graph)
-        #import pdb; pdb.set_trace()
-        #import torch.utils._pytree as pytree
-        #flat_tensor_args = pytree.tree_map(
-        #    lambda x: x.detach().requires_grad_(x.requires_grad)
-        #    if isinstance(x, torch.Tensor) else x, args
-        #)
-        #fake_mode = FakeTensorMode.push()
-        #with fake_mode as mode:
-        #    # Set input tensors that require grad to leaves
-        #    fake_flat_tensor_args = pytree.tree_map(
-        #        lambda x: mode.from_tensor(x) if mode else x
-        #        if isinstance(x, torch.Tensor) else x, args
-        #    )
-        #    with torch.set_grad_enabled(True):
-        #        out = graph_module(*fake_flat_tensor_args)
-        #    out = pytree.tree_map(
-        #        lambda x: x.detach().contiguous() if isinstance(x, torch.Tensor) else x, out
-        #    )
-        #    print("Fakeout")
-        #    print(out)
         return self.compile(graph_module, args)
