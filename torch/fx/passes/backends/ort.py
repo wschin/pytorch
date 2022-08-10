@@ -289,8 +289,8 @@ def decoreate_script_module(script_module, expected_inputs, expected_outputs):
             break
     for i, input in enumerate(script_module.graph.inputs()):
         input.setType(torch._C.TensorType.create_from_tensor(expected_inputs[i]))
-    #for i, output in enumerate(script_module.graph.outputs()):
-    #    output.setType(torch._C.TensorType.create_from_tensor(expected_outputs[i]))
+    for i, output in enumerate(script_module.graph.outputs()):
+        output.setType(torch._C.TensorType.create_from_tensor(expected_outputs[i]))
 
 def create_onnx_proto(script_module):
     onnx_proto = _jit_graph_to_onnx_model(script_module.graph, torch.onnx.OperatorExportTypes.ONNX, 14)
@@ -461,12 +461,12 @@ class OrtBackend:
                     import pdb; pdb.set_trace()
                     raise RuntimeError(f"Shape mismatch")
 
-            # Assume ONNX exporter doesn't change the order of arguments and return values in ScriptModule.
-            input_names = [input.name for input in onnx_model.graph.input]
-            output_names = [output.name for output in onnx_model.graph.output]
-            onnx_outputs = run_onnx_session(onnx_sess, input_names, args, output_names, outputs)
-            self.onnx_outputs[graph_module] = onnx_outputs
-
+        # Assume ONNX exporter doesn't change the order of arguments and return values in ScriptModule.
+        input_names = [input.name for input in onnx_model.graph.input]
+        output_names = [output.name for output in onnx_model.graph.output]
+        onnx_outputs = run_onnx_session(onnx_sess, input_names, args, output_names, outputs)
+        self.onnx_outputs[graph_module] = onnx_outputs
+        
         # invokes trace executor for running the prim graph
         nvfuser_outputs = execute(prim_module, *args, executor="nvfuser")
         if not isinstance(nvfuser_outputs, tuple):
@@ -487,7 +487,12 @@ class OrtBackend:
                 mismatch = True
         if mismatch:
             raise RuntimeError(f"Shape mismatch")
-        return nvfuser_outputs
+
+        #return nvfuser_outputs
+        if not isinstance(nvfuser_outputs, tuple):
+            return onnx_outputs[0]
+        else:
+            return onnx_outputs
 
     def compile(self, graph_module: GraphModule, args) -> GraphModule:
         # entry function for nvFuser backend
