@@ -1,8 +1,9 @@
-import copy
-from typing import Dict
+from typing import Type
+from typing import Dict, Tuple, List, Mapping
 
 import torch
 from torch._prims.nvfuser_executor import nvfuser_execute
+from torch.autograd.grad_mode import F
 from torch.nn import Module
 from torch._ops import OpOverload
 
@@ -14,18 +15,19 @@ from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 from torch._prims.executor import execute
 from torch.fx.experimental.proxy_tensor import DecompositionInterpreter
 from torch._decomp import decomposition_table
-
-import typing as t
+import onnxruntime
 
 import logging
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+
 def aten_to_dtype(self, dtype: torch.dtype, **kwargs):
     if len(kwargs) > 0 or not dtype:
         raise RuntimeError("No support for other to.dtype() formats other than to.dtype(self, dtype)")
     return torch._prims.convert_element_type(self, dtype)
+
 
 # decomposition_table currently contains both aten2aten and aten2prim decomposition
 # this is a hack to seperate them, as we only need aten2prim decomposition for nvfuser-supported aten graph lowering
@@ -214,7 +216,7 @@ class OrtOperatorSupport(OperatorSupport):
         super().__init__(support_dict)
 
     def is_node_supported(
-        self, submodules: t.Mapping[str, Module], node: Node
+        self, submodules: Mapping[str, Module], node: Node
     ) -> bool:
 
         # nvFuser FX subgraph should be purely functional
@@ -229,6 +231,7 @@ class OrtOperatorSupport(OperatorSupport):
                 return True
 
         return super().is_node_supported(submodules, node)
+
 
 def _jit_graph_to_onnx_model(graph, operator_export_type, opset_version):
     r"""
@@ -282,7 +285,8 @@ def fx_to_torchscript(fx_module):
     fx_module.recompile()
     return torch.jit.script(fx_module)
 
-def decoreate_script_module(script_module, expected_inputs, expected_outputs):
+
+def decorate_script_module(script_module, expected_inputs, expected_outputs):
     for i, v in enumerate(script_module.graph.inputs()):
         if v.debugName() == "self":
             script_module.graph.eraseInput(i)
@@ -292,29 +296,28 @@ def decoreate_script_module(script_module, expected_inputs, expected_outputs):
     for i, output in enumerate(script_module.graph.outputs()):
         output.setType(torch._C.TensorType.create_from_tensor(expected_outputs[i]))
 
+
 def create_onnx_proto(script_module):
     onnx_proto = _jit_graph_to_onnx_model(script_module.graph, torch.onnx.OperatorExportTypes.ONNX, 14)
-    if False: # print ONNX model
-        import onnx
-        onnx.save(onnx_proto, '/tmp/onnx_model.onnx')
-        m = onnx.load('/tmp/onnx_model.onnx')
-        onnx.checker.check_model(m)
-        print(m)
     return onnx_proto
+
 
 def create_onnx_model(onnx_proto):
     import onnx
-    onnx.save(onnx_proto, '/tmp/onnx_model.onnx')
-    m = onnx.load('/tmp/onnx_model.onnx')
-    onnx.checker.check_model(m)
-    return m
+    return onnx.ModelProto.FromString(onnx_proto)
+
 
 def create_onnx_session(onnx_proto):
-    import onnxruntime
     sess = onnxruntime.InferenceSession(onnx_proto, providers=["CPUExecutionProvider", "CUDAExecutionProvider"])
     return sess
 
-def run_onnx_session(sess, input_names, inputs, output_names, outputs):
+
+def run_onnx_session(
+        sess: Type[onnxruntime.InferenceSession],
+        input_names: List[str],
+        inputs: Tuple[torch.Tensor],
+        output_names: List[str],
+        outputs: Tuple[torch.Tensor]):
     import numpy as np
     _NP_DTYPE = {
         torch.float16: np.float16,
@@ -328,6 +331,7 @@ def run_onnx_session(sess, input_names, inputs, output_names, outputs):
         torch.bool: np.bool_,
     }
     binding = sess.io_binding()
+    # Bind inputs.
     inputs = [a.contiguous() for a in inputs]
     for name, value in zip(input_names, inputs):
         dev = value.device
@@ -339,7 +343,8 @@ def run_onnx_session(sess, input_names, inputs, output_names, outputs):
             value.size(),
             value.data_ptr(),
         )
-
+    # Pre-allocate outputs on the
+    # same devices as PyTorch outputs.
     allocated_outputs = tuple(
         torch.empty(
             t.shape,
@@ -350,6 +355,8 @@ def run_onnx_session(sess, input_names, inputs, output_names, outputs):
         )
         for t in outputs
     )
+    # Bind pre-allocated outputs to ORT values
+    # inside binding object.
     for name, value in zip(output_names, allocated_outputs):
         dev = value.device
         binding.bind_output(
@@ -364,140 +371,115 @@ def run_onnx_session(sess, input_names, inputs, output_names, outputs):
     sess.run_with_iobinding(binding)
     return allocated_outputs
 
+
+def assert_allclose_with_detailed_error_message(x: torch.Tensor, y: torch.Tensor, rtol: float = 1e-04, atol: float = 1e-04):
+    diff = x - y
+    real_atol = torch.max(torch.abs(diff))
+    max_value = torch.max(torch.abs(x), torch.abs(y))
+    real_rtol = torch.max(diff / max_value)
+    allclose = True if real_atol <= atol or real_rtol <= rtol else False
+    if not allclose:
+        raise RuntimeError(
+            "ONNX output doesn't match baseline output with " +
+            f"actual rtol={real_rtol} and actual atol={real_atol} " +
+            f"but expected rtol={rtol} and expected atol={atol}.")
+
+
 class OrtBackend:
     def __init__(self):
         self.supported_ops = OrtOperatorSupport()
-
         # TODO: this is a naive implementation of cache without proper guard
         self.partitioner_cache: Dict[GraphModule, GraphModule] = {}
-
-        # TODO: this is a naive implementation of cache without proper guard, this will only work for identical inputs
-        self.prim_decomp_cache: Dict[GraphModule, GraphModule] = {}
-        self.ort_module_cache = {}
         self.prim_outputs = {}
-        self.onnx_outputs = {}
-        self.onnx_models = {}
+        # TODO: this is a naive implementation of cache without proper guard, this will only work for identical inputs
         self.onnx_sessions = {}
+        self.onnx_model = {}
+        self.onnx_input_names = {}
+        self.onnx_output_names = {}
+        self.assert_allclose_to_baseline = True
 
     def lower_to_prims_and_execute(self, graph_module: GraphModule, *args, **kwargs):
-        # `graph_module` is an Aten-Fx graph
-        # "lowering to prims" and "trace execution" are grouped into this function, as they are both input dependent
-        if graph_module in self.prim_decomp_cache:
-            logging.debug("prim_decomp_cache hit!")
-            prim_module = self.prim_decomp_cache[graph_module]
-            onnx_sess = self.onnx_sessions[graph_module]
-            onnx_model = self.onnx_models[graph_module]
-            outputs = self.prim_outputs[graph_module]
+        if graph_module in self.onnx_sessions:
+            onnx_session = self.onnx_sessions[graph_module]
+            input_names = self.onnx_input_names[graph_module]
+            output_names = self.onnx_output_names[graph_module]
+            prim_outputs = self.prim_outputs[graph_module]
         else:
-            if False:
-                prim_graph = torch.fx.Graph()
-                DecompositionInterpreter(graph_module, prim_graph, decomposition_table=aten2aten_decomp).run(*args, **kwargs)
-                prim_module = torch.fx.GraphModule(graph_module, prim_graph)
-                self.prim_decomp_cache[graph_module] = prim_module
-                logging.debug("Lower to prims graph: ", prim_module.code)
-
-            prim_module = torch.fx.symbolic_trace(graph_module)
-            self.prim_decomp_cache[graph_module] = prim_module
-
-            duplicated_prim_graph = torch.fx.Graph()
-            outputs = DecompositionInterpreter(graph_module, duplicated_prim_graph, decomposition_table=aten2aten_decomp).run(*args, **kwargs)
-            print('outputs type:')
-            print(type(outputs))
-            if not isinstance(outputs, tuple):
-                outputs = (outputs,)
-            print('new outputs type:')
-            print(type(outputs))
-            print('duplicated_prim_graph.nodes after DecompositionInterpreter:')
-            print([n for n in duplicated_prim_graph.nodes])
-            self.prim_outputs[graph_module] = outputs
-            # Make sure graph_module is not changed.
-            if False:
-                # It's not used because 'output' is the last node.
-                # Clean nodes.
-                for node in reversed(duplicated_prim_graph.nodes):
-                    if node.op == 'output':
-                        break
-                    print('Removing node', node.op)
-                    duplicated_prim_graph.erase_node(node)
-            duplicated_prim_module = torch.fx.GraphModule(graph_module, duplicated_prim_graph)
-            print('duplicated_prim_module.graph.nodes after torch.fx.GraphModule:')
-            print([n for n in duplicated_prim_module.graph.nodes])
-            duplicated_prim_module.graph.lint()
-            print('duplicated_prim_module.graph.nodes after lint:')
-            print([n for n in duplicated_prim_module.graph.nodes])
-            duplicated_prim_module.recompile()
-            print('duplicated_prim_module.graph.nodes after recompile:')
-            print([n for n in duplicated_prim_module.graph.nodes])
-
-            script_module = fx_to_torchscript(duplicated_prim_module)
-            print('duplicated_prim_module.graph.nodes after fx_to_torchscript:')
-            print([n for n in duplicated_prim_module.graph.nodes])
-            decoreate_script_module(script_module, args, outputs)
-            print('duplicated_prim_module.graph.nodes after decoreate_script_module:')
-            print([n for n in duplicated_prim_module.graph.nodes])
+            # Create a new graph by applying operator decomposition
+            # onto the graph in "graph_module".
+            prim_graph = torch.fx.Graph()
+            # Sequentially go through each node in the graph and
+            # decompose it into a set of primitive operators.
+            # This decomposition triggers the actual computation of
+            # "graph_module" and returns the result "prim_outputs".
+            # "prim_outputs" is used as reference output so ORT knows how
+            # # to generates the same types as PyTorch.
+            #
+            # TODO(wechi): replace this with symbolic_trace in meta_trace.py
+            # to avoid actual computation.
+            prim_outputs = DecompositionInterpreter(
+                graph_module, prim_graph, decomposition_table=aten2aten_decomp).run(*args, **kwargs)
+            # Store reference outputs. They are used to indicate output
+            # tensors' types and devices when calling ORT.
+            self.prim_outputs[graph_module] = prim_outputs
+            # Wrap the new graph with primitive operators as a torch.fx.GraphModule
+            # so that torch.jit.script can compile it into a torch.jit.ScriptModule.
+            # This is necessary because most used ONNX exporter APIs only accepts
+            # graph (type: torch._C.Graph) in torch.jit.ScriptModule.
+            # TODO(wechi): We should have a new exporter to generate ONNX models
+            # directly from torch.fx.Graph.
+            prim_module = torch.fx.GraphModule(graph_module, prim_graph)
+            # Compile the torch.fx.GraphModule into a torch.jit.ScriptModule.
+            script_module = fx_to_torchscript(prim_module)
+            # Post-processing step to add expected input and output type information
+            # to the graph in torch.jit.ScriptModule. Expected inputs is "args" and "kwargs"
+            # while expected outputs is "prim_outputs".
+            if isinstance(prim_outputs, tuple):
+                decorate_script_module(script_module, args, prim_outputs)
+            else:
+                decorate_script_module(script_module, args, (prim_outputs,))
+            # Generate ONNX ModelProto from torch._C.Graph.
             onnx_proto = create_onnx_proto(script_module)
-            onnx_sess = create_onnx_session(onnx_proto)
-            self.onnx_sessions[graph_module] = onnx_sess
-
+            # Initialize a ORT session to execute this ONNX model.
+            onnx_session = create_onnx_session(onnx_proto)
+            # Cache ORT session. It's reused for the same "graph_module".
+            self.onnx_sessions[graph_module] = onnx_session
+            # Generate ONNX model and extract its input and output names.
+            # TODO(wechi): ORT session should provide a API to extract
+            # input and output names from the underlying model.
             onnx_model = create_onnx_model(onnx_proto)
-            print('duplicated_prim_module.graph.nodes after create_onnx_model:')
-            print([n for n in duplicated_prim_module.graph.nodes])
-            self.onnx_models[graph_module] = onnx_model
-            
-            if True:
-                # Check shape mismatch.
-                mismatch = False
+            input_names = [input.name for input in onnx_model.graph.input]
+            output_names = [output.name for output in onnx_model.graph.output]
+            self.onnx_input_names[graph_module] = input_names
+            self.onnx_output_names[graph_module] = output_names
 
-                for ort_out, fx_out in zip(onnx_model.graph.output, outputs):
-                    ort_shape = [i.dim_value for i in ort_out.type.tensor_type.shape.dim]
-                    #jit_shape = jit_out.type().sizes()
-                    fx_shape = [i for i in fx_out.shape]
-                    if ort_shape != fx_shape:
-                        print(f'{ort_shape} != {fx_shape}')
-                        mismatch = True
-                    else:
-                        print(f'{ort_shape} == {fx_shape}')
-                if mismatch:
-                    import pdb; pdb.set_trace()
-                    raise RuntimeError(f"Shape mismatch")
-
-        # Assume ONNX exporter doesn't change the order of arguments and return values in ScriptModule.
-        input_names = [input.name for input in onnx_model.graph.input]
-        output_names = [output.name for output in onnx_model.graph.output]
-        onnx_outputs = run_onnx_session(onnx_sess, input_names, args, output_names, outputs)
-        self.onnx_outputs[graph_module] = onnx_outputs
-        
-        # invokes trace executor for running the prim graph
-        nvfuser_outputs = execute(prim_module, *args, executor="nvfuser")
-        if not isinstance(nvfuser_outputs, tuple):
-            wrapped_nvfuser_outputs = (nvfuser_outputs,)
-        else:
-            wrapped_nvfuser_outputs = nvfuser_outputs
-        for value in args:
-            print(f'[input] module: {hash(prim_module)}, shape: {value.shape}, dtype: {value.dtype}')
-
-        mismatch = False
-        for prim_value, nv_value, onnx_value in zip(self.prim_outputs[graph_module], wrapped_nvfuser_outputs, self.onnx_outputs[graph_module]):
-            print(f'[PRI output] module: {hash(prim_module)}, shape: {prim_value.shape}, dtype: {prim_value.dtype}')
-            print(f'[NVF output] module: {hash(prim_module)}, shape: {nv_value.shape}, dtype: {nv_value.dtype}')
-            print(f'[ORT output] module: {hash(prim_module)}, shape: {onnx_value.shape}, dtype: {onnx_value.dtype}')
-            if prim_value.shape != nv_value.shape:
-                mismatch = True
-            if prim_value.shape != torch.Size(onnx_value.shape):
-                mismatch = True
-        if mismatch:
-            raise RuntimeError(f"Shape mismatch")
-
-        #return nvfuser_outputs
-        if not isinstance(nvfuser_outputs, tuple):
-            return onnx_outputs[0]
-        else:
+        if isinstance(prim_outputs, tuple):
+            # ORT always returns a tuple of outputs. If the original is a tuple, just returning
+            # ORT output is ok.
+            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, prim_outputs)
+            if self.assert_allclose_to_baseline:
+                # Compute baseline.
+                baeline_outputs = execute(graph_module, *args, executor="aten")
+                # Ensure every output tensor is close to the corresponding baseline.
+                for onnx_output, baseline_output in zip(onnx_outputs, baeline_outputs):
+                    assert_allclose_with_detailed_error_message(onnx_output, baseline_output)
             return onnx_outputs
+        else:
+            # ORT always returns a tuple of outputs. If the original is a tensor, the first element
+            # must be extracted and returned. Otherwise, type mismatch may happen in downstream
+            # computation.
+            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, (prim_outputs,))
+            assert len(onnx_outputs) == 1
+            if self.assert_allclose_to_baseline:
+                # Compute baseline.
+                baseline_outputs = execute(graph_module, *args, executor="aten")
+                # Ensure output tensor is close to the corresponding baseline.
+                assert_allclose_with_detailed_error_message(onnx_outputs[0], baseline_outputs)
+            return onnx_outputs[0]
 
     def compile(self, graph_module: GraphModule, args) -> GraphModule:
         # entry function for nvFuser backend
         logging.debug("Compiling graph_module: ", graph_module.code)
-        print("Compiling graph_module: ", graph_module.code)
 
         # FX graph based partitioning based on nvfuser supported ops
         if graph_module in self.partitioner_cache:
@@ -507,11 +489,8 @@ class OrtBackend:
             partitioner = CapabilityBasedPartitioner(
                 graph_module, self.supported_ops, allows_single_node_partition=False)
             fused_graph_module = partitioner.partition_and_fuse()
-            from torch.fx.passes.fake_tensor_prop import FakeTensorProp
-            FakeTensorProp(fused_graph_module).propagate(*args)
             self.partitioner_cache[graph_module] = fused_graph_module
 
-        print("Compiling fused_graph_module: ", fused_graph_module.code)
         # Overriding fused_module's __call__() function with lower_to_prims_and_execute()
         for node in fused_graph_module.graph.nodes:
             # TODO: use a better way to identify fused submodule
