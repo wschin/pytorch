@@ -1,3 +1,4 @@
+import logging
 from typing import Type
 from typing import Dict, Tuple, List, Mapping
 
@@ -17,7 +18,22 @@ from torch.fx.experimental.proxy_tensor import DecompositionInterpreter
 from torch._decomp import decomposition_table
 import onnxruntime
 
-import logging
+
+def get_onnx_supported_table():
+    from torch.onnx import _onnx_supported_ops
+    from torch.onnx._globals import GLOBALS
+    onnx_supported_ops = set()
+    for aten_op_name, opsets_string in _onnx_supported_ops.onnx_supported_ops():
+        # info[0] is aten symbol's name; e.g., "sum" for aten::sum.
+        # info[1] is the ONNX opsets that can express info[0]; e.g., "15 16 17"
+        # indicating opset 15, opset 16, and opset 17 can all express info[0].
+        if str(GLOBALS.export_onnx_opset_version) in opsets_string.split(' '):
+            onnx_supported_ops.add(aten_op_name)
+    return onnx_supported_ops
+
+
+onnx_supported_table = get_onnx_supported_table()
+
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -34,17 +50,17 @@ def aten_to_dtype(self, dtype: torch.dtype, **kwargs):
 aten2aten_decomp = {}
 aten2prim_decomp = {}
 
-for op, decomp_fn in decomposition_table.items():
-    if "torch._refs" in decomp_fn.__module__:
-        aten2prim_decomp[op] = decomp_fn
-    else:
-        aten2aten_decomp[op] = decomp_fn
-
 aten2aten_decomp_skips = {
     "aten.native_layer_norm_backward.default",
     "aten.embedding_dense_backward.default",   # This is hurting nvfuser's perf
-    "aten.addmm.default"
+    "aten.addmm.default",
+    # ONNX can directly export it. No need to decompose.
+    "aten.embedding.default",
+    "aten.unsqueeze.default",
 }
+
+for aten_op_name in onnx_supported_table:
+    aten2aten_decomp_skips.add(f"aten.{aten_op_name}.default")
 
 for op, decomp_fn in decomposition_table.items():
     if "torch._refs" in decomp_fn.__module__:
@@ -52,7 +68,6 @@ for op, decomp_fn in decomposition_table.items():
     else:
         if str(op) not in aten2aten_decomp_skips:
             aten2aten_decomp[op] = decomp_fn
-
 
 aten2prim_decomp[torch.ops.aten.to.dtype] = aten_to_dtype
 
@@ -76,8 +91,6 @@ class OrtOperatorSupport(OperatorSupport):
         # whether operation would be runnable by primTorch+nvFuser.
         # We will iterate on this list to reflect the the reality.
         support_dict = {
-            # ===============================================================
-            # call_function aten
             # ===============================================================
             # Following supported aten ops is copied from torch/csrc/jit/codegen/cuda/parser.cpp
             # TODO: might need to update according to supported input types
@@ -211,16 +224,24 @@ class OrtOperatorSupport(OperatorSupport):
             # ===============================================================
             "getattr": None,
             "_operator.getitem": None,
+
+            # ===============================================================
+            # Try more for BERT
+            # ===============================================================
+            "torch.ops.aten.embedding": None,
+            "torch.ops.aten.unsqueeze": None,
         }
+        for aten_op_name in onnx_supported_table:
+            support_dict[f"torch.ops.aten.{aten_op_name}"] = None
 
         super().__init__(support_dict)
 
     def is_node_supported(
         self, submodules: Mapping[str, Module], node: Node
     ) -> bool:
-
         # nvFuser FX subgraph should be purely functional
         if node.op not in CALLABLE_NODE_OPS:
+            print(f"1 Unsupported op={node.op}, target={node.target}")
             return False
 
         # ops in supported_dict doesn't have overload name
@@ -228,9 +249,16 @@ class OrtOperatorSupport(OperatorSupport):
         if isinstance(node.target, OpOverload):
             target = _get_qualified_name(node.target.overloadpacket)
             if target in self._support_dict:
+                print(f"2 Supported op={node.op}, target={node.target}, target_name={target}")
                 return True
+            print(f"2 Unsupported op={node.op}, target={node.target}, target_name={target}")
 
-        return super().is_node_supported(submodules, node)
+        supported = super().is_node_supported(submodules, node)
+        if not supported:
+            print(f"3 Unsupported op={node.op}, target={node.target})")
+            return False
+        print(f"3 Supported op={node.op}, target={node.target}")
+        return supported
 
 
 def _jit_graph_to_onnx_model(graph, operator_export_type, opset_version):
@@ -265,6 +293,21 @@ def _jit_graph_to_onnx_model(graph, operator_export_type, opset_version):
         {},
     )
     return proto
+
+
+def move_placeholder_to_front(graph_module: torch.fx.GraphModule):
+    graph = graph_module.graph
+    placeholders = list()
+    first_not_placeholder = None
+    for node in graph.nodes:
+        if node.op == "placeholder":
+            placeholders.append(node)
+        if first_not_placeholder is None and node.op != "placeholder":
+            first_not_placeholder = node
+    if first_not_placeholder is None:
+        return
+    for placeholder in placeholders:
+        first_not_placeholder.prepend(placeholder)
 
 
 def fx_to_torchscript(fx_module):
@@ -308,7 +351,7 @@ def create_onnx_model(onnx_proto):
 
 
 def create_onnx_session(onnx_proto):
-    sess = onnxruntime.InferenceSession(onnx_proto, providers=["CPUExecutionProvider", "CUDAExecutionProvider"])
+    sess = onnxruntime.InferenceSession(onnx_proto, providers=["CUDAExecutionProvider"])
     return sess
 
 
@@ -318,6 +361,7 @@ def run_onnx_session(
         inputs: Tuple[torch.Tensor],
         output_names: List[str],
         outputs: Tuple[torch.Tensor]):
+    torch.cuda.nvtx.range_push("ORT")
     import numpy as np
     _NP_DTYPE = {
         torch.float16: np.float16,
@@ -369,10 +413,11 @@ def run_onnx_session(
         )
 
     sess.run_with_iobinding(binding)
+    torch.cuda.nvtx.range_pop()
     return allocated_outputs
 
 
-def assert_allclose_with_detailed_error_message(x: torch.Tensor, y: torch.Tensor, rtol: float = 1e-04, atol: float = 1e-04):
+def assert_allclose_with_detailed_error_message(x: torch.Tensor, y: torch.Tensor, rtol: float = 1e-03, atol: float = 1e-04):
     diff = x - y
     real_atol = torch.max(torch.abs(diff))
     max_value = torch.max(torch.abs(x), torch.abs(y))
@@ -396,7 +441,7 @@ class OrtBackend:
         self.onnx_model = {}
         self.onnx_input_names = {}
         self.onnx_output_names = {}
-        self.assert_allclose_to_baseline = True
+        self.assert_allclose_to_baseline = False
 
     def lower_to_prims_and_execute(self, graph_module: GraphModule, *args, **kwargs):
         if graph_module in self.onnx_sessions:
@@ -408,6 +453,8 @@ class OrtBackend:
             # Create a new graph by applying operator decomposition
             # onto the graph in "graph_module".
             prim_graph = torch.fx.Graph()
+            # TODO(wechi): this is a workaround for #84311.
+            move_placeholder_to_front(graph_module)
             # Sequentially go through each node in the graph and
             # decompose it into a set of primitive operators.
             # This decomposition triggers the actual computation of
