@@ -1,19 +1,9 @@
-import logging
-from typing import Type
-from typing import Dict, Tuple, List, Mapping
+from typing import Type, Dict, Tuple, List, Mapping, Any
 
 import torch
-from torch._prims.nvfuser_executor import nvfuser_execute
-from torch.autograd.grad_mode import F
-from torch.nn import Module
-from torch._ops import OpOverload
-
-from torch.fx import GraphModule
-from torch.fx.node import Node, _get_qualified_name
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
-from torch._prims.executor import execute
 from torch.fx.experimental.proxy_tensor import DecompositionInterpreter
 from torch._decomp import decomposition_table
 import onnxruntime
@@ -35,10 +25,9 @@ def get_onnx_supported_table():
 onnx_supported_table = get_onnx_supported_table()
 
 
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
-
-support_dict = {}
+# The keys of this dictionary are OpOverload's which can be
+# exported by ONNX exporter. Type of key is torch._ops.OpOverload.
+support_dict: Dict[torch._ops.OpOverload, Any] = {}
 for aten_op_name in onnx_supported_table:
     # Some assumptions for mapping ONNX exporter to "target"
     # in torch.fx.Node.
@@ -48,7 +37,7 @@ for aten_op_name in onnx_supported_table:
     #    This assumption is reasonable because in _run_symbolic_function,
     #    torch._C.Node.kind() is used as the key to lookup for exporting
     #    function and it doesn't include overload.
-    # 2. Assume that exporting functions' names are in aten domain.  
+    # 2. Assume that exporting functions' names are in aten domain.
     op_overload_packet = getattr(torch.ops.aten, aten_op_name)
     for overload in op_overload_packet.overloads():
         op_overload = getattr(op_overload_packet, overload)
@@ -83,23 +72,17 @@ extra_support_dict = {}
 extra_support_dict["getattr"] = None
 extra_support_dict["_operator.getitem"] = None
 
+
 class OrtOperatorSupport(OperatorSupport):
     """
-    Operator support for nvFuser backend.
-
-    Currently, partitioning is based on FX ATen graph. The fused subgraph will latter be decomposed into prims.
-    To determine if an ATen ops is supported by nvFuser, we shall check the prim ops used in its ref decomposition.
-    Only if all the prim ops in the ref has a nvfuser_impl, we say this Aten op is suppported by nvFuser.
-
-    Note: When adding a rule, please add it to the corresponding section and follow the
-    alphabetical order.
+    Operator support for ONNXRuntime backend.
     """
 
     def __init__(self):
         super().__init__(extra_support_dict)
 
     def is_node_supported(
-        self, submodules: Mapping[str, Module], node: Node
+        self, submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node
     ) -> bool:
         if node.op not in CALLABLE_NODE_OPS:
             return False
@@ -283,7 +266,7 @@ class OrtBackend:
     def __init__(self):
         self.supported_ops = OrtOperatorSupport()
         # TODO: this is a naive implementation of cache without proper guard
-        self.partitioner_cache: Dict[GraphModule, GraphModule] = {}
+        self.partitioner_cache: Dict[torch.fx.GraphModule, torch.fx.GraphModule] = {}
         self.prim_outputs = {}
         # TODO: this is a naive implementation of cache without proper guard, this will only work for identical inputs
         self.onnx_sessions = {}
@@ -292,7 +275,7 @@ class OrtBackend:
         self.onnx_output_names = {}
         self.assert_allclose_to_baseline = False
 
-    def lower_to_prims_and_execute(self, graph_module: GraphModule, *args, **kwargs):
+    def lower_to_prims_and_execute(self, graph_module: torch.fx.GraphModule, *args, **kwargs):
         if graph_module in self.onnx_sessions:
             onnx_session = self.onnx_sessions[graph_module]
             input_names = self.onnx_input_names[graph_module]
@@ -355,7 +338,7 @@ class OrtBackend:
             onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, prim_outputs)
             if self.assert_allclose_to_baseline:
                 # Compute baseline.
-                baeline_outputs = execute(graph_module, *args, executor="aten")
+                baeline_outputs = torch._prims.executor.execute(graph_module, *args, executor="aten")
                 # Ensure every output tensor is close to the corresponding baseline.
                 for onnx_output, baseline_output in zip(onnx_outputs, baeline_outputs):
                     assert_allclose_with_detailed_error_message(onnx_output, baseline_output)
@@ -368,18 +351,14 @@ class OrtBackend:
             assert len(onnx_outputs) == 1
             if self.assert_allclose_to_baseline:
                 # Compute baseline.
-                baseline_outputs = execute(graph_module, *args, executor="aten")
+                baseline_outputs = torch._prims.executor.execute(graph_module, *args, executor="aten")
                 # Ensure output tensor is close to the corresponding baseline.
                 assert_allclose_with_detailed_error_message(onnx_outputs[0], baseline_outputs)
             return onnx_outputs[0]
 
-    def compile(self, graph_module: GraphModule, args) -> GraphModule:
-        # entry function for nvFuser backend
-        logging.debug("Compiling graph_module: ", graph_module.code)
-
-        # FX graph based partitioning based on nvfuser supported ops
+    def compile(self, graph_module: torch.fx.GraphModule, args) -> torch.fx.GraphModule:
+        # FX graph based partitioning based on ONNX supported ops.
         if graph_module in self.partitioner_cache:
-            logging.debug("partitioner_cache hit!")
             fused_graph_module = self.partitioner_cache[graph_module]
         else:
             partitioner = CapabilityBasedPartitioner(
@@ -396,5 +375,5 @@ class OrtBackend:
 
         return fused_graph_module
 
-    def __call__(self, graph_module: GraphModule, args) -> GraphModule:
+    def __call__(self, graph_module: torch.fx.GraphModule, args) -> torch.fx.GraphModule:
         return self.compile(graph_module, args)
