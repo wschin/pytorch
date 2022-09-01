@@ -1,22 +1,28 @@
-from typing import Type, Dict, Tuple, List, Mapping, Any
+import logging
+import onnxruntime  # type: ignore
+from typing import Type, Dict, Tuple, List, Mapping, Any, Callable
 
 import torch
+import torch._prims.executor
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 from torch.fx.experimental.proxy_tensor import DecompositionInterpreter
 from torch._decomp import decomposition_table
-import onnxruntime
 
+
+logger = logging.getLogger(__name__)
+# Uncomment the following line to print out development info.
+# logger.setLevel(logging.INFO)
 
 def get_onnx_supported_table():
     from torch.onnx import _onnx_supported_ops
     from torch.onnx._globals import GLOBALS
     onnx_supported_ops = set()
     for aten_op_name, opsets_string in _onnx_supported_ops.onnx_supported_ops():
-        # info[0] is aten symbol's name; e.g., "sum" for aten::sum.
-        # info[1] is the ONNX opsets that can express info[0]; e.g., "15 16 17"
-        # indicating opset 15, opset 16, and opset 17 can all express info[0].
+        # aten_op_name is aten symbol's name; e.g., "sum" for aten::sum.
+        # opsets_string is the ONNX opsets that can express info[0]; e.g., "15 16 17"
+        # indicates that opset 15, opset 16, and opset 17 can all express aten_op_name.
         if str(GLOBALS.export_onnx_opset_version) in opsets_string.split(' '):
             onnx_supported_ops.add(aten_op_name)
     return onnx_supported_ops
@@ -27,27 +33,32 @@ onnx_supported_table = get_onnx_supported_table()
 
 # The keys of this dictionary are OpOverload's which can be
 # exported by ONNX exporter. Type of key is torch._ops.OpOverload.
+# For example, if torch.ops.aten.add.default is a key in support_dict,
+# all torch.fx.Node's with torch.ops.aten.add.default as target will
+# be selected by CapabilityBasedPartitioner and sent to ORT for
+# computation.
+# We choose torch._ops.OpOverload as the key because
+#  1. torch._ops.OpOverload uniquely identifies an op. We don't want
+#     to use OpOverloadPacket because it contains overloads of the same op.
+#     This allows us to select supported ops at the finest grain.
+#  2. torch._ops.OpOverload is what we get from torch.fx.Node.target. Getting
+#     qualified name using _get_qualified_name is not needed.
 support_dict: Dict[torch._ops.OpOverload, Any] = {}
 for aten_op_name in onnx_supported_table:
-    # Some assumptions for mapping ONNX exporter to "target"
-    # in torch.fx.Node.
-    # 1. ONNX exporters are not registered with overloads, so
-    #    we assume the exporter function "def add(...)" supports all
-    #    overloads of torch.ops.aten.add (type: torch._ops.OpOverload).
-    #    This assumption is reasonable because in _run_symbolic_function,
-    #    torch._C.Node.kind() is used as the key to lookup for exporting
-    #    function and it doesn't include overload.
-    # 2. Assume that exporting functions' names are in aten domain.
     op_overload_packet = getattr(torch.ops.aten, aten_op_name)
+    # Due to the lack of overload name in exporting function's name, assume
+    # each exporting function (e.g., torch.onnx.symbolic_opset9.add) support
+    # all overloads (e.g., in torch.ops.aten.add).
+    # Thus, we register all torch._ops.OpOverload's for the same exporting function.
+    # Please manually exclude torch._ops.OpOverload if exporter fails.
     for overload in op_overload_packet.overloads():
         op_overload = getattr(op_overload_packet, overload)
-        print(f"op_overload:  {op_overload}, tyep of op_overload: {type(op_overload)}")
         support_dict[op_overload] = None
 
-# decomposition_table currently contains both aten2aten and aten2prim decomposition
-# this is a hack to seperate them, as we only need aten2prim decomposition for nvfuser-supported aten graph lowering
-aten2aten_decomp = {}
-aten2prim_decomp = {}
+# decomposition_table currently contains both aten2aten and aten2prim decompositions
+# This is a hack to seperate them, as ONNX only recognizes aten symbols.
+aten2aten_decomp: Dict[torch._ops.OpOverload, Callable] = {}
+aten2prim_decomp: Dict[torch._ops.OpOverload, Callable] = {}
 
 for op, decomp_fn in decomposition_table.items():
     if op in support_dict:
@@ -66,16 +77,21 @@ for op, decomp_fn in decomposition_table.items():
 # TODO(wechi): implement exporting functions for all
 # primitive ops.
 support_dict[torch.ops.aten._softmax.default] = None
-# They are converted to ONNX-compatible ops by torch.jit.
-# They don't have direct ONNX exporting functions.
-extra_support_dict = {}
+
+# Some torch.fx.Node's are converted to ONNX-compatible ops
+# by torch.jit.script. They don't have direct ONNX exporting
+# functions but still runnable in ORT.
+extra_support_dict: Dict[str, Any] = {}
 extra_support_dict["getattr"] = None
 extra_support_dict["_operator.getitem"] = None
 
 
 class OrtOperatorSupport(OperatorSupport):
     """
-    Operator support for ONNXRuntime backend.
+    Operator support for ONNXRuntime backend. It has two-level of support decision.
+    One is via support_dict and the other one is via extra_support_dict. The logic
+    of using support_dict is implemented in OrtOperatorSupport and extra_support_dict
+    is used by OperatorSupport.is_node_supported.
     """
 
     def __init__(self):
@@ -84,13 +100,24 @@ class OrtOperatorSupport(OperatorSupport):
     def is_node_supported(
         self, submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node
     ) -> bool:
+        # OperatorSupport.is_node_supported returns True for non-callable nodes.
+        # Since ORT can't execute them, we return False here to override the base
+        # behavior. 
         if node.op not in CALLABLE_NODE_OPS:
             return False
+        # This is the and the only place to decide if aten op is supported.
         if node.op == "call_function" and node.target in support_dict:
-            print(f"[O] node.target: {node.target}, type of node.target: {type(node.target)}")
+            logger.info(f"support_dict supports node.target: {node.target} (type: {type(node.target)})")
             return True
-        print(f"[X] node.target: {node.target}, type of node.target: {type(node.target)}")
-        return super().is_node_supported(submodules, node)
+        logger.info(f"support_dict doesn't support node.target: {node.target} (type: {type(node.target)})")
+        # If node.target is not in support_dict, we still want to check if torch.jit.script
+        # can convert it to ONNX equivalence. Let's use base mechanism to do this.
+        # See extra_support_dict  for supported ops.
+        if super().is_node_supported(submodules, node):
+            logger.info(f"extra_support_dict supports node.target: {node.target} (type: {type(node.target)})")
+            return True
+        logger.info(f"extra_support_dict doesn't supports node.target: {node.target} (type: {type(node.target)})")
+        return False
 
 
 def _jit_graph_to_onnx_model(graph, operator_export_type, opset_version):
@@ -253,6 +280,7 @@ def assert_allclose_with_detailed_error_message(x: torch.Tensor, y: torch.Tensor
     diff = x - y
     real_atol = torch.max(torch.abs(diff))
     max_value = torch.max(torch.abs(x), torch.abs(y))
+    max_value[max_value == 0.] = 1.
     real_rtol = torch.max(diff / max_value)
     allclose = True if real_atol <= atol or real_rtol <= rtol else False
     if not allclose:
@@ -333,9 +361,10 @@ class OrtBackend:
             self.onnx_output_names[graph_module] = output_names
 
         if isinstance(prim_outputs, tuple):
+            assert all(isinstance(elem, torch.Tensor) for elem in prim_outputs)
             # ORT always returns a tuple of outputs. If the original is a tuple, just returning
             # ORT output is ok.
-            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, prim_outputs)
+            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, prim_outputs)  # type: ignore
             if self.assert_allclose_to_baseline:
                 # Compute baseline.
                 baeline_outputs = torch._prims.executor.execute(graph_module, *args, executor="aten")
@@ -344,10 +373,11 @@ class OrtBackend:
                     assert_allclose_with_detailed_error_message(onnx_output, baseline_output)
             return onnx_outputs
         else:
-            # ORT always returns a tuple of outputs. If the original is a tensor, the first element
-            # must be extracted and returned. Otherwise, type mismatch may happen in downstream
-            # computation.
-            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, (prim_outputs,))
+            assert isinstance(prim_outputs, torch.Tensor)
+            # ORT always returns a tuple of outputs. If the original output is a tensor,
+            # ORT output's first element must be extracted and returned. Otherwise, type
+            # mismatch may happen in downstream computation.
+            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, (prim_outputs,))  # type: ignore
             assert len(onnx_outputs) == 1
             if self.assert_allclose_to_baseline:
                 # Compute baseline.

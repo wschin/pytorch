@@ -1017,6 +1017,12 @@ def view(g: jit_utils.GraphContext, self, size):
     return reshape(g, self, size)
 
 
+@_onnx_symbolic("aten::_unsafe_view")
+@symbolic_helper.parse_args("v", "is")
+def _unsafe_view(g: jit_utils.GraphContext, self, size):
+    return reshape(g, self, size)
+
+
 @_onnx_symbolic("aten::view_as")
 @_beartype.beartype
 def view_as(g: jit_utils.GraphContext, self, other):
