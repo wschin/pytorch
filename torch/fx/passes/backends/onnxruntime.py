@@ -38,39 +38,50 @@ onnx_supported_table = get_onnx_supported_table()
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-
-def aten_to_dtype(self, dtype: torch.dtype, **kwargs):
-    if len(kwargs) > 0 or not dtype:
-        raise RuntimeError("No support for other to.dtype() formats other than to.dtype(self, dtype)")
-    return torch._prims.convert_element_type(self, dtype)
-
+support_dict = {}
+for aten_op_name in onnx_supported_table:
+    # Some assumptions for mapping ONNX exporter to "target"
+    # in torch.fx.Node.
+    # 1. ONNX exporters are not registered with overloads, so
+    #    we assume the exporter function "def add(...)" supports all
+    #    overloads of torch.ops.aten.add (type: torch._ops.OpOverload).
+    #    This assumption is reasonable because in _run_symbolic_function,
+    #    torch._C.Node.kind() is used as the key to lookup for exporting
+    #    function and it doesn't include overload.
+    # 2. Assume that exporting functions' names are in aten domain.  
+    op_overload_packet = getattr(torch.ops.aten, aten_op_name)
+    for overload in op_overload_packet.overloads():
+        op_overload = getattr(op_overload_packet, overload)
+        print(f"op_overload:  {op_overload}, tyep of op_overload: {type(op_overload)}")
+        support_dict[op_overload] = None
 
 # decomposition_table currently contains both aten2aten and aten2prim decomposition
 # this is a hack to seperate them, as we only need aten2prim decomposition for nvfuser-supported aten graph lowering
 aten2aten_decomp = {}
 aten2prim_decomp = {}
 
-aten2aten_decomp_skips = {
-    "aten.native_layer_norm_backward.default",
-    "aten.embedding_dense_backward.default",   # This is hurting nvfuser's perf
-    "aten.addmm.default",
-    # ONNX can directly export it. No need to decompose.
-    "aten.embedding.default",
-    "aten.unsqueeze.default",
-}
-
-for aten_op_name in onnx_supported_table:
-    aten2aten_decomp_skips.add(f"aten.{aten_op_name}.default")
-
 for op, decomp_fn in decomposition_table.items():
+    if op in support_dict:
+        # ONNX can express this op, no need to decompose.
+        continue
     if "torch._refs" in decomp_fn.__module__:
         aten2prim_decomp[op] = decomp_fn
     else:
-        if str(op) not in aten2aten_decomp_skips:
-            aten2aten_decomp[op] = decomp_fn
+        # Assume ONNX can express ops after decomposition.
+        # If no, exporter will fail and the user need to
+        # remove this decomposition rule.
+        aten2aten_decomp[op] = decomp_fn
 
-aten2prim_decomp[torch.ops.aten.to.dtype] = aten_to_dtype
-
+# Added extra because they will be decomposed into supported
+# primitives by DecompositionInterpreter.
+# TODO(wechi): implement exporting functions for all
+# primitive ops.
+support_dict[torch.ops.aten._softmax.default] = None
+# They are converted to ONNX-compatible ops by torch.jit.
+# They don't have direct ONNX exporting functions.
+extra_support_dict = {}
+extra_support_dict["getattr"] = None
+extra_support_dict["_operator.getitem"] = None
 
 class OrtOperatorSupport(OperatorSupport):
     """
@@ -85,180 +96,18 @@ class OrtOperatorSupport(OperatorSupport):
     """
 
     def __init__(self):
-
-        # TODO: current list copied from torch/csrc/jit/codegen/cuda/parser.cpp is incorrect,
-        # as that file is solely for TorchScript and doesn't represent the actual status
-        # whether operation would be runnable by primTorch+nvFuser.
-        # We will iterate on this list to reflect the the reality.
-        support_dict = {
-            # ===============================================================
-            # Following supported aten ops is copied from torch/csrc/jit/codegen/cuda/parser.cpp
-            # TODO: might need to update according to supported input types
-            "torch.ops.aten.add": None,
-            "torch.ops.aten.sub": None,
-            # "torch.ops.aten.rsub": None,    # rsub decomp is supported at aten2aten level
-            "torch.ops.aten.div": None,
-            "torch.ops.aten.atan2": None,
-            "torch.ops.aten.mul": None,
-            "torch.ops.aten.max": None,
-            "torch.ops.aten.min": None,
-            "torch.ops.aten.pow": None,
-            "torch.ops.aten.remainder": None,
-            "torch.ops.aten.fmod": None,
-            "torch.ops.aten.bitwise_and": None,
-            "torch.ops.aten.__and__": None,
-            "torch.ops.aten.bitwise_or": None,
-            "torch.ops.aten.__or__": None,
-            "torch.ops.aten.bitwise_xor": None,
-            "torch.ops.aten.__xor__": None,
-            "torch.ops.aten.bitwise_left_shift": None,
-            "torch.ops.aten.__lshift__": None,
-            "torch.ops.aten.bitwise_right_shift": None,
-            "torch.ops.aten.__rshift__": None,
-            "torch.ops.aten.eq": None,
-            "torch.ops.aten.ne": None,
-            "torch.ops.aten.ge": None,
-            "torch.ops.aten.gt": None,
-            "torch.ops.aten.le": None,
-            "torch.ops.aten.lt": None,
-            "torch.ops.aten.abs": None,
-            "torch.ops.aten.bitwise_not": None,
-            "torch.ops.aten.ceil": None,
-            "torch.ops.aten.floor": None,
-            "torch.ops.aten.frac": None,
-            "torch.ops.aten.neg": None,
-            "torch.ops.aten.relu": None,
-            "torch.ops.aten.round": None,
-            "torch.ops.aten.silu": None,
-            "torch.ops.aten.trunc": None,
-            "torch.ops.aten.log": None,
-            "torch.ops.aten.log10": None,
-            "torch.ops.aten.log1p": None,
-            "torch.ops.aten.log2": None,
-            "torch.ops.aten.lgamma": None,
-            "torch.ops.aten.exp": None,
-            "torch.ops.aten.expm1": None,
-            "torch.ops.aten.erf": None,
-            "torch.ops.aten.erfc": None,
-            "torch.ops.aten.cos": None,
-            "torch.ops.aten.acos": None,
-            "torch.ops.aten.cosh": None,
-            "torch.ops.aten.sin": None,
-            "torch.ops.aten.asin": None,
-            "torch.ops.aten.sinh": None,
-            "torch.ops.aten.tan": None,
-            "torch.ops.aten.atan": None,
-            "torch.ops.aten.tanh": None,
-            "torch.ops.aten.atanh": None,
-            "torch.ops.aten.sqrt": None,
-            "torch.ops.aten.rsqrt": None,
-            "torch.ops.aten.reciprocal": None,
-            "torch.ops.aten.sigmoid": None,
-            "torch.ops.aten.isfinite": None,
-            "torch.ops.aten.isinf": None,
-            "torch.ops.aten.isnan": None,
-            "torch.ops.aten.isneginf": None,
-            "torch.ops.aten.isposinf": None,
-            "torch.ops.aten.isreal": None,
-            # "torch.ops.aten.rand_like": None,  # causing Node empty_like_default does not support nvfuser
-            "torch.ops.aten.softplus": None,
-            "torch.ops.aten.threshold": None,
-            # relying on aten->aten->prim decomp, aten2aten is using unsupported aten.new_zero op
-            # "torch.ops.aten.threshold_backward": None,
-            "torch.ops.aten.clamp": None,
-            # "torch.ops.aten.clone": None,
-            # Failing with where(): incompatible function arguments: \
-            # [<torch._C._nvfuser.TensorView, tensor, <torch._C._nvfuser.TensorView]
-            # failing with BERT_pytorch_forward_0, which has aten.where.ScalarSelf in the decomps
-            # "torch.ops.aten.where": None,
-            # However, aten.where.self overload is fully supported
-            "torch.ops.aten.where.self": None,
-            "torch.ops.aten.lerp": None,
-            "torch.ops.aten.addcmul": None,
-            # "torch.ops.aten.native_dropout": None,    # missing refs for aten.rank_like
-            "torch.ops.aten.dropout": None,
-            # "torch.ops.aten.native_dropout_backward": None,   # missing refs for aten.type_as
-            "torch.ops.aten.instance_norm": None,
-            "torch.ops.aten._batch_norm_impl_index": None,
-            # "torch.ops.aten.native_batch_norm": None,     # missing refs for aten.var
-            "torch.ops.aten.batch_norm": None,
-            "torch.ops.aten.cudnn_batch_norm": None,
-            "torch.ops.aten._batch_norm_impl_index_backward": None,
-            # "torch.ops.aten.native_batch_norm_backward": None,    # should have been handled at aten2aten decomp
-            "torch.ops.aten.native_layer_norm": None,
-            "torch.ops.aten.layer_norm": None,
-            # relying on aten->aten->prim decomp, aten2aten is using unsupported aten.div
-            # "torch.ops.aten.native_layer_norm_backward": None,
-            "torch.ops.aten.softmax.int": None,
-            "torch.ops.aten.log_softmax.int": None,
-            # relying on aten->aten->prim decomp, aten2aten is using unsupported aten.amax
-            # "torch.ops.aten._softmax": None,
-            "torch.ops.aten._log_softmax_backward_data": None,
-            # "torch.ops.aten._softmax_backward_data": None,  # Node _softmax_backward_data_default does not support nvfuser
-            # "torch.ops.aten.var.dim": None,       # missing refs
-            "torch.ops.aten.std.dim": None,
-            "torch.ops.aten.sum": None,
-            # "torch.ops.aten.mean.dim": None,      # missing refs
-            "torch.ops.aten._grad_sum_to_size": None,
-            "torch.ops.aten.sum_to_size": None,
-            "torch.ops.aten._autocast_to_reduced_precision": None,
-            "torch.ops.aten._autocast_to_full_precision": None,
-            # "torch.ops.aten.to.dtype": None,      # causing segfault
-            # "torch.ops.aten.type_as": None,       # missing refs
-            "torch.ops.aten.linear": None,
-            "torch.ops.aten.gelu": None,
-            # "torch.ops.aten.gelu_backward": None,       # gelu_backward is handled at aten2aten decomp
-            # "torch.ops.aten.hardtanh": None,        # has functional ref, using unsupported aten.clamp
-            "torch.ops.aten.leaky_relu": None,
-            "torch.ops.aten.square": None,
-            # relying on aten->aten->prim decomp, aten2aten is using unsupported aten.conj_physical
-            "torch.ops.aten.tanh_backward": None,
-            # "torch.ops.aten.amax": None,      # missing prim decomp
-            # "torch.ops.aten.amin": None,      # missing prim decomp
-            # "torch.ops.aten.reshape": None,
-            # "torch.ops.aten.view": None,      # missing prim decomp
-            "torch.ops.aten.flatten.using_ints": None,
-
-            # ===============================================================
-            # call_function builtins and operator
-            # ===============================================================
-            "getattr": None,
-            "_operator.getitem": None,
-
-            # ===============================================================
-            # Try more for BERT
-            # ===============================================================
-            "torch.ops.aten.embedding": None,
-            "torch.ops.aten.unsqueeze": None,
-        }
-        for aten_op_name in onnx_supported_table:
-            support_dict[f"torch.ops.aten.{aten_op_name}"] = None
-
-        super().__init__(support_dict)
+        super().__init__(extra_support_dict)
 
     def is_node_supported(
         self, submodules: Mapping[str, Module], node: Node
     ) -> bool:
-        # nvFuser FX subgraph should be purely functional
         if node.op not in CALLABLE_NODE_OPS:
-            print(f"1 Unsupported op={node.op}, target={node.target}")
             return False
-
-        # ops in supported_dict doesn't have overload name
-        # use overloadpacket's qualified_name for OpOverload
-        if isinstance(node.target, OpOverload):
-            target = _get_qualified_name(node.target.overloadpacket)
-            if target in self._support_dict:
-                print(f"2 Supported op={node.op}, target={node.target}, target_name={target}")
-                return True
-            print(f"2 Unsupported op={node.op}, target={node.target}, target_name={target}")
-
-        supported = super().is_node_supported(submodules, node)
-        if not supported:
-            print(f"3 Unsupported op={node.op}, target={node.target})")
-            return False
-        print(f"3 Supported op={node.op}, target={node.target}")
-        return supported
+        if node.op == "call_function" and node.target in support_dict:
+            print(f"[O] node.target: {node.target}, type of node.target: {type(node.target)}")
+            return True
+        print(f"[X] node.target: {node.target}, type of node.target: {type(node.target)}")
+        return super().is_node_supported(submodules, node)
 
 
 def _jit_graph_to_onnx_model(graph, operator_export_type, opset_version):
