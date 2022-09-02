@@ -4,6 +4,7 @@ from typing import Type, Dict, Tuple, List, Mapping, Any, Callable
 
 import torch
 import torch._prims.executor
+from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
@@ -324,11 +325,10 @@ class OrtBackend:
             #
             # TODO(wechi): replace this with symbolic_trace in meta_trace.py
             # to avoid actual computation.
-            prim_outputs = DecompositionInterpreter(
+            # TODO(wechi): move it to compile(...) below so that ORT can
+            # get bigger sub-graphs by partitioning graph with primitives.
+            DecompositionInterpreter(
                 graph_module, prim_graph, decomposition_table=aten2aten_decomp).run(*args, **kwargs)
-            # Store reference outputs. They are used to indicate output
-            # tensors' types and devices when calling ORT.
-            self.prim_outputs[graph_module] = prim_outputs
             # Wrap the new graph with primitive operators as a torch.fx.GraphModule
             # so that torch.jit.script can compile it into a torch.jit.ScriptModule.
             # This is necessary because most used ONNX exporter APIs only accepts
@@ -336,6 +336,10 @@ class OrtBackend:
             # TODO(wechi): We should have a new exporter to generate ONNX models
             # directly from torch.fx.Graph.
             prim_module = torch.fx.GraphModule(graph_module, prim_graph)
+            # Store reference outputs. They are used to indicate output
+            # tensors' types and devices when calling ORT.
+            prim_outputs = FakeTensorProp(prim_module).propagate(*args, **kwargs)
+            self.prim_outputs[graph_module] = prim_outputs
             # Compile the torch.fx.GraphModule into a torch.jit.ScriptModule.
             script_module = fx_to_torchscript(prim_module)
             # Post-processing step to add expected input and output type information
