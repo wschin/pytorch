@@ -8,7 +8,7 @@ from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
-from torch.fx.experimental.proxy_tensor import DecompositionInterpreter
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch._decomp import decomposition_table
 
 
@@ -72,12 +72,6 @@ for op, decomp_fn in decomposition_table.items():
         # If no, exporter will fail and the user need to
         # remove this decomposition rule.
         aten2aten_decomp[op] = decomp_fn
-
-# Added extra because they will be decomposed into supported
-# primitives by DecompositionInterpreter.
-# TODO(wechi): implement exporting functions for all
-# primitive ops.
-support_dict[torch.ops.aten._softmax.default] = None
 
 # Some torch.fx.Node's are converted to ONNX-compatible ops
 # by torch.jit.script. They don't have direct ONNX exporting
@@ -311,37 +305,14 @@ class OrtBackend:
             output_names = self.onnx_output_names[graph_module]
             prim_outputs = self.prim_outputs[graph_module]
         else:
-            # Create a new graph by applying operator decomposition
-            # onto the graph in "graph_module".
-            prim_graph = torch.fx.Graph()
             # TODO(wechi): this is a workaround for #84311.
             move_placeholder_to_front(graph_module)
-            # Sequentially go through each node in the graph and
-            # decompose it into a set of primitive operators.
-            # This decomposition triggers the actual computation of
-            # "graph_module" and returns the result "prim_outputs".
-            # "prim_outputs" is used as reference output so ORT knows how
-            # # to generates the same types as PyTorch.
-            #
-            # TODO(wechi): replace this with symbolic_trace in meta_trace.py
-            # to avoid actual computation.
-            # TODO(wechi): move it to compile(...) below so that ORT can
-            # get bigger sub-graphs by partitioning graph with primitives.
-            DecompositionInterpreter(
-                graph_module, prim_graph, decomposition_table=aten2aten_decomp).run(*args, **kwargs)
-            # Wrap the new graph with primitive operators as a torch.fx.GraphModule
-            # so that torch.jit.script can compile it into a torch.jit.ScriptModule.
-            # This is necessary because most used ONNX exporter APIs only accepts
-            # graph (type: torch._C.Graph) in torch.jit.ScriptModule.
-            # TODO(wechi): We should have a new exporter to generate ONNX models
-            # directly from torch.fx.Graph.
-            prim_module = torch.fx.GraphModule(graph_module, prim_graph)
             # Store reference outputs. They are used to indicate output
             # tensors' types and devices when calling ORT.
-            prim_outputs = FakeTensorProp(prim_module).propagate(*args, **kwargs)
+            prim_outputs = FakeTensorProp(graph_module).propagate(*args, **kwargs)
             self.prim_outputs[graph_module] = prim_outputs
             # Compile the torch.fx.GraphModule into a torch.jit.ScriptModule.
-            script_module = fx_to_torchscript(prim_module)
+            script_module = fx_to_torchscript(graph_module)
             # Post-processing step to add expected input and output type information
             # to the graph in torch.jit.ScriptModule. Expected inputs is "args" and "kwargs"
             # while expected outputs is "prim_outputs".
@@ -393,21 +364,22 @@ class OrtBackend:
     def compile(self, graph_module: torch.fx.GraphModule, args) -> torch.fx.GraphModule:
         # FX graph based partitioning based on ONNX supported ops.
         if graph_module in self.partitioner_cache:
-            fused_graph_module = self.partitioner_cache[graph_module]
+            partitioned_prim_graph_module = self.partitioner_cache[graph_module]
         else:
+            prim_graph_module = make_fx(graph_module, decomposition_table=aten2aten_decomp)(*args)
             partitioner = CapabilityBasedPartitioner(
-                graph_module, self.supported_ops, allows_single_node_partition=False)
-            fused_graph_module = partitioner.partition_and_fuse()
-            self.partitioner_cache[graph_module] = fused_graph_module
+                prim_graph_module, self.supported_ops, allows_single_node_partition=False)
+            partitioned_prim_graph_module = partitioner.partition_and_fuse()
+            self.partitioner_cache[graph_module] = partitioned_prim_graph_module
 
-        # Overriding fused_module's __call__() function with lower_to_prims_and_execute()
-        for node in fused_graph_module.graph.nodes:
-            # TODO: use a better way to identify fused submodule
-            if node.op == "call_module" and "fused_" in node.name:
-                fused_module = getattr(fused_graph_module, node.name)
-                fused_module._wrapped_call = self.lower_to_prims_and_execute
+            # Overriding fused_module's __call__() function with lower_to_prims_and_execute()
+            for node in partitioned_prim_graph_module.graph.nodes:
+                # TODO: use a better way to identify fused submodule
+                if node.op == "call_module" and "fused_" in node.name:
+                    fused_module = getattr(partitioned_prim_graph_module, node.name)
+                    fused_module._wrapped_call = self.lower_to_prims_and_execute
 
-        return fused_graph_module
+        return partitioned_prim_graph_module
 
     def __call__(self, graph_module: torch.fx.GraphModule, args) -> torch.fx.GraphModule:
         return self.compile(graph_module, args)
