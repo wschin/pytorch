@@ -14,17 +14,27 @@ from torch._decomp import decomposition_table
 
 logger = logging.getLogger(__name__)
 # Uncomment the following line to print out development info.
-# logger.setLevel(logging.INFO)
+#logger.setLevel(logging.INFO)
 
 def get_onnx_supported_table():
     from torch.onnx import _onnx_supported_ops
     from torch.onnx._globals import GLOBALS
     onnx_supported_ops = set()
-    for aten_op_name, opsets_string in _onnx_supported_ops.onnx_supported_ops():
+    for aten_op_name, schema in _onnx_supported_ops.all_symbolics_schemas().items():
+        # TODO(wechi): aten_op_name could be prim::add in addition to aten::add.
+        # We should build another dictionary for storing support table for prim ops.
+        # Currently, we only consider aten ops as before.
+        if not aten_op_name.startswith("aten::"):
+            continue
+        short_op_name = aten_op_name.split('aten::')[1]
+        if not hasattr(torch.ops.aten, short_op_name):
+            # Some aten ops are not in torch.ops.aten. Those are excluded until we
+            # figure out why.
+            continue
         # aten_op_name is aten symbol's name; e.g., "sum" for aten::sum.
         # opsets_string is the ONNX opsets that can express info[0]; e.g., "15 16 17"
         # indicates that opset 15, opset 16, and opset 17 can all express aten_op_name.
-        if str(GLOBALS.export_onnx_opset_version) in opsets_string.split(' '):
+        if GLOBALS.export_onnx_opset_version in schema.opsets:
             onnx_supported_ops.add(aten_op_name)
     return onnx_supported_ops
 
@@ -46,7 +56,8 @@ onnx_supported_table = get_onnx_supported_table()
 #     qualified name using _get_qualified_name is not needed.
 support_dict: Dict[torch._ops.OpOverload, Any] = {}
 for aten_op_name in onnx_supported_table:
-    op_overload_packet = getattr(torch.ops.aten, aten_op_name)
+    short_op_name = aten_op_name.split('aten::')[1]
+    op_overload_packet = getattr(torch.ops.aten, short_op_name)
     # Due to the lack of overload name in exporting function's name, assume
     # each exporting function (e.g., torch.onnx.symbolic_opset9.add) support
     # all overloads (e.g., in torch.ops.aten.add).
