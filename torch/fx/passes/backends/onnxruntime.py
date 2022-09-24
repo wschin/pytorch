@@ -11,6 +11,17 @@ from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch._decomp import decomposition_table
 
+from onnxruntime.capi import _pybind_state as ORTC
+
+def get_ort_device_type(device_type, device_index):
+    if device_type == "cuda":
+        return ORTC.OrtDevice.cuda()
+    elif device_type == "cpu":
+        return ORTC.OrtDevice.cpu()
+    elif device_type == "ort":
+        return ORTC.get_ort_device(device_index).device_type()
+    else:
+        raise Exception("Unsupported device type: " + device_type)
 
 logger = logging.getLogger(__name__)
 # Uncomment the following line to print out development info.
@@ -25,16 +36,19 @@ def get_onnx_supported_table():
         # We should build another dictionary for storing support table for prim ops.
         # Currently, we only consider aten ops as before.
         if not aten_op_name.startswith("aten::"):
+            logger.info(f"Skip non-aten op supported by ONNX exporter: {aten_op_name}")
             continue
         short_op_name = aten_op_name.split('aten::')[1]
         if not hasattr(torch.ops.aten, short_op_name):
             # Some aten ops are not in torch.ops.aten. Those are excluded until we
             # figure out why.
+            logger.info(f"Skip op not found in torch.ops.aten supported by ONNX exporter: {aten_op_name}")
             continue
         # aten_op_name is aten symbol's name; e.g., "sum" for aten::sum.
         # opsets_string is the ONNX opsets that can express info[0]; e.g., "15 16 17"
         # indicates that opset 15, opset 16, and opset 17 can all express aten_op_name.
         if GLOBALS.export_onnx_opset_version in schema.opsets:
+            logger.info(f"Add {aten_op_name} to supported ops.")
             onnx_supported_ops.add(aten_op_name)
     return onnx_supported_ops
 
@@ -90,6 +104,7 @@ for op, decomp_fn in decomposition_table.items():
 extra_support_dict: Dict[str, Any] = {}
 extra_support_dict["getattr"] = None
 extra_support_dict["_operator.getitem"] = None
+
 
 
 class OrtOperatorSupport(OperatorSupport):
@@ -241,7 +256,10 @@ def run_onnx_session(
     }
     binding = sess.io_binding()
     # Bind inputs.
+    torch.cuda.nvtx.range_push("contiguous inputs")
     inputs = [a.contiguous() for a in inputs]
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("bind_input")
     for name, value in zip(input_names, inputs):
         dev = value.device
         binding.bind_input(
@@ -252,8 +270,10 @@ def run_onnx_session(
             value.size(),
             value.data_ptr(),
         )
+    torch.cuda.nvtx.range_pop()
     # Pre-allocate outputs on the
     # same devices as PyTorch outputs.
+    torch.cuda.nvtx.range_push("allocated_output")
     allocated_outputs = tuple(
         torch.empty(
             t.shape,
@@ -264,8 +284,10 @@ def run_onnx_session(
         )
         for t in outputs
     )
+    torch.cuda.nvtx.range_pop()
     # Bind pre-allocated outputs to ORT values
     # inside binding object.
+    torch.cuda.nvtx.range_push("bind_output")
     for name, value in zip(output_names, allocated_outputs):
         dev = value.device
         binding.bind_output(
@@ -276,11 +298,115 @@ def run_onnx_session(
             value.size(),
             value.data_ptr(),
         )
+    torch.cuda.nvtx.range_pop()
 
     sess.run_with_iobinding(binding)
     torch.cuda.nvtx.range_pop()
     return allocated_outputs
 
+
+def run_onnx_session_batch_binding(
+        sess: Type[onnxruntime.InferenceSession],
+        input_names: List[str],
+        inputs: Tuple[torch.Tensor],
+        output_names: List[str],
+        outputs: Tuple[torch.Tensor]):
+    torch.cuda.nvtx.range_push("ORT")
+    import numpy as np
+    _NP_DTYPE = {
+        torch.float16: np.float16,
+        torch.float32: np.float32,
+        torch.float64: np.float64,
+        torch.uint8: np.uint8,
+        torch.int8: np.int8,
+        torch.int16: np.int16,
+        torch.int32: np.int32,
+        torch.int64: np.longlong,
+        torch.bool: np.bool_,
+    }
+    binding = sess.io_binding()
+    # Bind inputs.
+    torch.cuda.nvtx.range_push("contiguous inputs")
+    inputs = [a.contiguous() for a in inputs]
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("bind_input")
+    names = []
+    devices = []
+    dtypes = []
+    shapes = []
+    data_ptrs = []
+    for name, value in zip(input_names, inputs):
+        names.append(name)
+        device_type = value.device.type
+        device_id = value.device.index or 0
+        devices.append(
+            ORTC.OrtDevice(
+                get_ort_device_type(device_type, device_id),
+                ORTC.OrtDevice.default_memory(),
+                device_id,
+            )
+        )
+        dtypes.append(_NP_DTYPE[value.dtype])
+        shapes.append(value.size())
+        data_ptrs.append(value.data_ptr())
+    binding.bind_inputs(names, devices, dtypes, shapes, data_ptrs)
+    torch.cuda.nvtx.range_pop()
+    # Pre-allocate outputs on the
+    # same devices as PyTorch outputs.
+    torch.cuda.nvtx.range_push("allocated_output")
+    allocated_outputs = tuple(
+        torch.empty(
+            t.shape,
+            dtype=t.dtype,
+            layout=t.layout,
+            device=t.device,
+            requires_grad=t.requires_grad,
+        )
+        for t in outputs
+    )
+    torch.cuda.nvtx.range_pop()
+    # Bind pre-allocated outputs to ORT values
+    # inside binding object.
+    torch.cuda.nvtx.range_push("bind_output")
+    for name, value in zip(output_names, outputs):
+        dev = value.device
+        binding.bind_output(
+            name,
+            dev.type,
+            dev.index or 0,
+            _NP_DTYPE[value.dtype],
+            value.size(),
+            value.data_ptr(),
+        )
+    torch.cuda.nvtx.range_pop()
+
+    sess.run_with_iobinding(binding)
+    torch.cuda.nvtx.range_pop()
+    return allocated_outputs
+
+
+def run_onnx_session_fast(
+        sess: Type[onnxruntime.InferenceSession],
+        input_names: List[str],
+        inputs: Tuple[torch.Tensor],
+        output_names: List[str],
+        outputs: Tuple[torch.Tensor]):
+    from onnxruntime.capi import _pybind_state as ORTC
+    ort_inputs = ORTC.OrtValueVector()
+    ort_inputs.reserve(len(inputs))
+    ort_outputs = ORTC.OrtValueVector()
+    torch.cuda.nvtx.range_push("run_with_ort_value_vector")
+    for value in inputs:
+        if not value.is_contiguous():
+            value = value.contiguous()
+        valid_ort_tensor = onnxruntime.training.ortmodule._utils._torch_tensor_to_dlpack(value)
+        ort_inputs.push_back(valid_ort_tensor, value.dtype == torch.bool)
+
+    sess.run_with_ort_value_vector(input_names, ort_inputs, output_names, ort_outputs)
+    print(f"# outs: {len(outputs)}")
+    pth_outputs = onnxruntime.training.ortmodule._utils._ortvalues_to_torch_tensor_cast(ort_outputs, outputs)
+    torch.cuda.nvtx.range_pop()
+    return pth_outputs
 
 def assert_allclose_with_detailed_error_message(x: torch.Tensor, y: torch.Tensor, rtol: float = 1e-03, atol: float = 1e-04):
     diff = x - y
@@ -350,7 +476,17 @@ class OrtBackend:
             assert all(isinstance(elem, torch.Tensor) for elem in prim_outputs)
             # ORT always returns a tuple of outputs. If the original is a tuple, just returning
             # ORT output is ok.
-            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, prim_outputs)  # type: ignore
+            #torch.cuda.nvtx.range_push("run_onnx_session")
+            #onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, prim_outputs)  # type: ignore
+            #torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("run_with_ort_values_fast")
+            onnx_outputs = run_onnx_session_fast(onnx_session, input_names, args, output_names, prim_outputs)
+            torch.cuda.nvtx.range_pop()
+
+            #torch.cuda.nvtx.range_push("run_with_batch_binding")
+            #onnx_outputs = run_onnx_session_batch_binding(onnx_session, input_names, args, output_names, prim_outputs)
+            #torch.cuda.nvtx.range_pop()
             if self.assert_allclose_to_baseline:
                 # Compute baseline.
                 baeline_outputs = torch._prims.executor.execute(graph_module, *args, executor="aten")
