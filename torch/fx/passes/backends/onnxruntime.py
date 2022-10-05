@@ -13,6 +13,19 @@ from torch._decomp import decomposition_table
 
 from onnxruntime.capi import _pybind_state as ORTC
 
+import numpy as np
+_NP_DTYPE = {
+    torch.float16: np.float16,
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.uint8: np.uint8,
+    torch.int8: np.int8,
+    torch.int16: np.int16,
+    torch.int32: np.int32,
+    torch.int64: np.longlong,
+    torch.bool: np.bool_,
+}
+
 def get_ort_device_type(device_type, device_index):
     if device_type == "cuda":
         return ORTC.OrtDevice.cuda()
@@ -242,18 +255,6 @@ def run_onnx_session(
         output_names: List[str],
         outputs: Tuple[torch.Tensor]):
     torch.cuda.nvtx.range_push("ORT")
-    import numpy as np
-    _NP_DTYPE = {
-        torch.float16: np.float16,
-        torch.float32: np.float32,
-        torch.float64: np.float64,
-        torch.uint8: np.uint8,
-        torch.int8: np.int8,
-        torch.int16: np.int16,
-        torch.int32: np.int32,
-        torch.int64: np.longlong,
-        torch.bool: np.bool_,
-    }
     binding = sess.io_binding()
     # Bind inputs.
     torch.cuda.nvtx.range_push("contiguous inputs")
@@ -304,6 +305,53 @@ def run_onnx_session(
     torch.cuda.nvtx.range_pop()
     return allocated_outputs
 
+def run_onnx_session_bind_real_input_fake_output(
+        sess: Type[onnxruntime.InferenceSession],
+        input_names: List[str],
+        inputs: Tuple[torch.Tensor],
+        output_names: List[str],
+        outputs: Tuple[torch.Tensor]):
+    torch.cuda.nvtx.range_push("ORT")
+    binding = sess.io_binding()
+    # Bind inputs.
+    torch.cuda.nvtx.range_push("contiguous inputs")
+    inputs = [a.contiguous() for a in inputs]
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("bind_input")
+    for name, value in zip(input_names, inputs):
+        dev = value.device
+        binding.bind_input(
+            name,
+            dev.type,
+            dev.index or 0,
+            _NP_DTYPE[value.dtype],
+            value.size(),
+            value.data_ptr(),
+        )
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("bind_output_device")
+    for name, value in zip(output_names, outputs):
+        dev = value.device
+        binding.bind_output_name_and_device(
+            name,
+            ORTC.OrtDevice(
+                get_ort_device_type(dev.type, dev.index or 0),
+                ORTC.OrtDevice.default_memory(),
+                dev.index or 0,
+            )
+        )
+
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("run_with_iobinding")
+    sess.run_with_iobinding(binding)
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("convert to torch")
+    pth_outputs = onnxruntime.training.ortmodule._utils._ortvalues_to_torch_tensor_cast(binding.get_outputs_as_ortvaluevector(), outputs)
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_pop()
+    return pth_outputs
 
 def run_onnx_session_batch_binding(
         sess: Type[onnxruntime.InferenceSession],
@@ -368,7 +416,7 @@ def run_onnx_session_batch_binding(
     # Bind pre-allocated outputs to ORT values
     # inside binding object.
     torch.cuda.nvtx.range_push("bind_output")
-    for name, value in zip(output_names, outputs):
+    for name, value in zip(output_names, allocated_outputs):
         dev = value.device
         binding.bind_output(
             name,
@@ -391,20 +439,71 @@ def run_onnx_session_fast(
         inputs: Tuple[torch.Tensor],
         output_names: List[str],
         outputs: Tuple[torch.Tensor]):
+    torch.cuda.nvtx.range_push("before run_with_ort_value_vector")
     from onnxruntime.capi import _pybind_state as ORTC
     ort_inputs = ORTC.OrtValueVector()
     ort_inputs.reserve(len(inputs))
     ort_outputs = ORTC.OrtValueVector()
-    torch.cuda.nvtx.range_push("run_with_ort_value_vector")
     for value in inputs:
         if not value.is_contiguous():
             value = value.contiguous()
         valid_ort_tensor = onnxruntime.training.ortmodule._utils._torch_tensor_to_dlpack(value)
         ort_inputs.push_back(valid_ort_tensor, value.dtype == torch.bool)
+    torch.cuda.nvtx.range_pop()
 
-    sess.run_with_ort_value_vector(input_names, ort_inputs, output_names, ort_outputs)
+    torch.cuda.nvtx.range_push("run_with_ort_value_vector")
+    sess.run_with_ort_value_vector_and_devices(input_names, ort_inputs, output_names, ort_outputs)
+    torch.cuda.nvtx.range_pop()
     print(f"# outs: {len(outputs)}")
+
+    torch.cuda.nvtx.range_push("after run_with_ort_value_vector")
     pth_outputs = onnxruntime.training.ortmodule._utils._ortvalues_to_torch_tensor_cast(ort_outputs, outputs)
+    torch.cuda.nvtx.range_pop()
+    return pth_outputs
+
+def run_onnx_session_new_wrap(
+        sess: Type[onnxruntime.InferenceSession],
+        input_names: List[str],
+        inputs: Tuple[torch.Tensor],
+        output_names: List[str],
+        outputs: Tuple[torch.Tensor]):
+    torch.cuda.nvtx.range_push("before run_with_ort_value_vector_and_devices")
+    from onnxruntime.capi import _pybind_state as ORTC
+    ort_inputs = ORTC.OrtValueVector()
+    ort_inputs.reserve(len(inputs))
+    ort_outputs = ORTC.OrtValueVector()
+    devices = []
+    dtypes = []
+    shapes = []
+    data_ptrs = []
+
+    for value in inputs:
+        device_type = value.device.type
+        device_id = value.device.index or 0
+        devices.append(
+            ORTC.OrtDevice(
+                get_ort_device_type(device_type, device_id),
+                ORTC.OrtDevice.default_memory(),
+                device_id,
+            )
+        )
+        dtypes.append(_NP_DTYPE[value.dtype])
+        shapes.append(value.size())
+        data_ptrs.append(value.data_ptr())
+    torch.cuda.nvtx.range_pop()
+
+    ort_inputs.set_all_values(inputs, data_ptrs, dtypes, shapes, devices)
+
+    torch.cuda.nvtx.range_push("run_with_ort_value_vector_and_devices")
+    sess.run_with_ort_value_vector_and_devices(input_names, ort_inputs, output_names, ort_outputs)
+    torch.cuda.nvtx.range_pop()
+    print(f"# outs: {len(outputs)}")
+
+    torch.cuda.nvtx.range_push("after run_with_ort_value_vector_and_devices")
+
+    #pth_outputs = onnxruntime.training.ortmodule._utils._ortvalues_to_torch_tensor_cast(ort_outputs, outputs)
+    from torch._C import _from_dlpack
+    pth_outputs = ort_outputs.to_dlpacks(_from_dlpack)
     torch.cuda.nvtx.range_pop()
     return pth_outputs
 
@@ -480,13 +579,21 @@ class OrtBackend:
             #onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, prim_outputs)  # type: ignore
             #torch.cuda.nvtx.range_pop()
 
-            torch.cuda.nvtx.range_push("run_with_ort_values_fast")
-            onnx_outputs = run_onnx_session_fast(onnx_session, input_names, args, output_names, prim_outputs)
-            torch.cuda.nvtx.range_pop()
-
-            #torch.cuda.nvtx.range_push("run_with_batch_binding")
-            #onnx_outputs = run_onnx_session_batch_binding(onnx_session, input_names, args, output_names, prim_outputs)
+            #torch.cuda.nvtx.range_push("run_with_ort_values_fast")
+            #onnx_outputs = run_onnx_session_fast(onnx_session, input_names, args, output_names, prim_outputs)
             #torch.cuda.nvtx.range_pop()
+
+            #torch.cuda.nvtx.range_push("run_with_ort_values_new_wrap")
+            #onnx_outputs = run_onnx_session_new_wrap(onnx_session, input_names, args, output_names, prim_outputs)
+            #torch.cuda.nvtx.range_pop()
+
+            #torch.cuda.nvtx.range_push("run_onnx_session_bind_real_input_fake_output")
+            #onnx_outputs = run_onnx_session_bind_real_input_fake_output(onnx_session, input_names, args, output_names, prim_outputs)
+            #torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("run_with_batch_binding")
+            onnx_outputs = run_onnx_session_batch_binding(onnx_session, input_names, args, output_names, prim_outputs)
+            torch.cuda.nvtx.range_pop()
             if self.assert_allclose_to_baseline:
                 # Compute baseline.
                 baeline_outputs = torch._prims.executor.execute(graph_module, *args, executor="aten")
@@ -499,7 +606,11 @@ class OrtBackend:
             # ORT always returns a tuple of outputs. If the original output is a tensor,
             # ORT output's first element must be extracted and returned. Otherwise, type
             # mismatch may happen in downstream computation.
-            onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, (prim_outputs,))  # type: ignore
+            #onnx_outputs = run_onnx_session(onnx_session, input_names, args, output_names, (prim_outputs,))  # type: ignore
+            #onnx_outputs = run_onnx_session_fast(onnx_session, input_names, args, output_names, (prim_outputs,))
+            #onnx_outputs = run_onnx_session_new_wrap(onnx_session, input_names, args, output_names, (prim_outputs,))
+            onnx_outputs = run_onnx_session_batch_binding(onnx_session, input_names, args, output_names, (prim_outputs,))
+            #onnx_outputs = run_onnx_session_bind_real_input_fake_output(onnx_session, input_names, args, output_names, prim_outputs)
             assert len(onnx_outputs) == 1
             if self.assert_allclose_to_baseline:
                 # Compute baseline.
