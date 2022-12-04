@@ -1021,6 +1021,12 @@ def view(g: jit_utils.GraphContext, self, size):
     return reshape(g, self, size)
 
 
+@_onnx_symbolic("aten::_unsafe_view")
+@symbolic_helper.parse_args("v", "is")
+def _unsafe_view(g: jit_utils.GraphContext, self, size):
+    return reshape(g, self, size)
+
+
 @_onnx_symbolic("aten::view_as")
 @_beartype.beartype
 def view_as(g: jit_utils.GraphContext, self, other):
@@ -4092,6 +4098,12 @@ def to(g: jit_utils.GraphContext, self, *args):
         return g.op("Cast", self, to_i=_type_utils.JitScalarType(dtype).onnx_type())
 
     return symbolic_helper._onnx_unsupported("Unknown aten::to signature", self)
+
+
+@_onnx_symbolic("aten::_to_copy")
+@_beartype.beartype
+def _to_copy(g, self, *args):
+    return to(g, self, *args)
 
 
 @_onnx_symbolic("aten::repeat")
