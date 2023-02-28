@@ -30,7 +30,7 @@ from torch.nn.utils import stateless
 from torch.onnx import _constants, _type_utils
 
 from torch.onnx._internal import _beartype, onnx_proto_utils
-from torch.onnx._internal.fx import diagnostics, function_dispatcher, options
+from torch.onnx._internal.fx import diagnostics, function_dispatcher, options, tracer
 from torch.utils import _pytree
 
 # TODO: Separate into individual components.
@@ -613,7 +613,7 @@ def _rename_placeholder_targets(
     module.recompile()
 
 
-@_beartype.beartype
+#@_beartype.beartype
 def _export(
     module: torch.fx.GraphModule,
     args,
@@ -884,7 +884,7 @@ def export_without_parameters_and_buffers(
     Tuple[Any, ...],
 ]:
 
-    graph_module, bound_args = _trace_into_fx_graph_via_fx_symbolic_trace(
+    graph_module, bound_args = tracer._trace_through_dispatcher(
         module, *args, **kwargs
     )
 
@@ -907,14 +907,14 @@ def export_without_parameters_and_buffers(
     return (
         _export(
             graph_module,
-            (*bound_args, *replaced_attrs),
+            (*args, *replaced_attrs),
             opset_version=opset_version,
             decomposition_table=decomposition_table,
             use_binary_format=use_binary_format,
             op_level_debug=op_level_debug,
         ),
         graph_module,
-        bound_args,
+        args,
         replaced_attrs,
     )
 
