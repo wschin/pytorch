@@ -425,8 +425,6 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
         ]
     )
     def test_llama_decoder_with_local_backend(self, test_local_backend: bool):
-        import inspect
-
         from transformers import LlamaConfig  # noqa: F811
         from transformers.models.llama.modeling_llama import (  # noqa: F811
             LlamaDecoderLayer,
