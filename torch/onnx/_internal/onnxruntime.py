@@ -121,8 +121,8 @@ def _get_ort_device_type(device_type: str):
 
 logger = logging.getLogger(__name__)
 # Uncomment the following lines to print out development info.
-# logging.basicConfig(level=logging.WARNING)
-# logger.setLevel(logging.WARNING)
+logging.basicConfig(level=logging.WARNING)
+logger.setLevel(logging.WARNING)
 
 
 class OrtOperatorSupport(OperatorSupport):
@@ -173,7 +173,7 @@ class OrtOperatorSupport(OperatorSupport):
             )
             return True
         logger.warning(
-            "extra_support_dict doesn't supports node.target: %s (type: %s)",
+            "extra_support_dict doesn't support node.target: %s (type: %s)",
             node.target,
             type(node.target),
         )
@@ -313,23 +313,46 @@ def _sort_eps(eps: Tuple[str, ...]) -> Tuple[str, ...]:
     return tuple(sorted(unique_eps, key=get_execution_provider_priority, reverse=True))
 
 
-def _get_onnx_devices(values: Tuple[torch.Tensor, ...]) -> Tuple["ORTC.OrtDevice", ...]:
-    assert all(
-        value.device == values[0].device for value in values
-    ), "All values must be on the same device."
+def _get_onnx_devices(
+    values: Tuple[
+        Union[
+            torch.Tensor, torch.SymInt, int, torch.SymFloat, float, torch.SymBool, bool
+        ],
+        ...,
+    ]
+) -> Tuple["ORTC.OrtDevice", ...]:
+    devices = tuple(value.device for value in values if isinstance(value, torch.Tensor))
+    if len(devices) == 0:
+        devices = (torch.device("cpu"),)
 
     def _device_id_or_zero(device_id: int) -> int:
         return device_id or 0
 
-    devices: Tuple["ORTC.OrtDevice", ...] = tuple(
-        ORTC.OrtDevice(
-            _get_ort_device_type(value.device.type),
-            ORTC.OrtDevice.default_memory(),
-            _device_id_or_zero(value.device.index),
-        )
-        for value in values
+    def _map_tensor_or_sym_to_device(
+        value: Union[
+            torch.Tensor, torch.SymInt, int, torch.SymFloat, float, torch.SymBool, bool
+        ],
+        device: torch.device,
+    ) -> int:
+        if isinstance(value, torch.Tensor):
+            return ORTC.OrtDevice(
+                _get_ort_device_type(device.type),
+                ORTC.OrtDevice.default_memory(),
+                _device_id_or_zero(device.index),
+            )
+        elif isinstance(
+            value, (torch.SymInt, int, torch.SymFloat, float, torch.SymBool, bool)
+        ):
+            return ORTC.OrtDevice(
+                _get_ort_device_type("cpu"), ORTC.OrtDevice.default_memory(), 0
+            )
+        else:
+            raise ValueError("Unsupported value type: " + str(type(value)))
+
+    ort_devices = tuple(
+        _map_tensor_or_sym_to_device(value, devices[0]) for value in values
     )
-    return devices
+    return ort_devices
 
 
 def _get_ortvalues_from_torch_tensors(
@@ -356,6 +379,53 @@ def _to_real_tensor(tensor: FakeTensor) -> torch.Tensor:
     return out
 
 
+def _adjust_scalar_from_fx_to_onnx(
+    dynamo_value: Union[
+        torch.Tensor,
+        int,
+        float,
+        bool,
+    ],
+    value_info: "onnx.ValueInfoProto",
+) -> torch.Tensor:
+    if (
+        isinstance(dynamo_value, torch.Tensor)
+        and len(value_info.type.tensor_type.shape.dim) == 0
+        and dynamo_value.shape == (1,)
+    ):
+        return torch.squeeze(dynamo_value)
+    elif isinstance(dynamo_value, int):
+        return torch.tensor(dynamo_value, dtype=torch.int64)
+    elif isinstance(dynamo_value, float):
+        return torch.tensor(dynamo_value, dtype=torch.float32)
+    elif isinstance(dynamo_value, bool):
+        return torch.tensor(dynamo_value, dtype=torch.bool)
+    else:
+        return dynamo_value
+
+
+def _adjust_scalar_from_onnx_to_fx(
+    tensor: torch.Tensor,
+    prim_value: Union[
+        torch.Tensor,
+        torch.SymInt,
+        int,
+        torch.SymFloat,
+        float,
+        torch.SymBool,
+        bool,
+    ],
+) -> Union[torch.Tensor, int, float, bool,]:
+    assert isinstance(tensor, torch.Tensor), "ORT's output must be tensor."
+    if isinstance(
+        prim_value,
+        (torch.SymInt, int, torch.SymFloat, float, torch.SymBool, bool),
+    ):
+        # Convert tensor back to scalar to match Dynamo's expectation.
+        return tensor.item()
+    return tensor
+
+
 def _run_onnx_session_with_ortvaluevector(
     sess: "onnxruntime.InferenceSession",
     input_names: Tuple[str, ...],
@@ -365,13 +435,23 @@ def _run_onnx_session_with_ortvaluevector(
     outputs: Tuple[torch.Tensor, ...],
     output_devices: Tuple["ORTC.OrtDevice", ...],
     preallocate_output: bool,
-) -> Tuple[torch.Tensor, ...]:
+    input_value_infos: Tuple["onnx.ValueInfoProto", ...],  # type: ignore[name-defined]
+    normalized_prim_outputs: Tuple[
+        Union[
+            torch.Tensor, torch.SymInt, int, torch.SymFloat, float, torch.SymBool, bool
+        ],
+        ...,
+    ],
+) -> Tuple[Union[torch.Tensor, int, float, bool], ...]:
     _nvtx_range_push("contiguous")
     inputs = tuple(a.contiguous() for a in inputs)
+    inputs = tuple(
+        _adjust_scalar_from_fx_to_onnx(arg, value_info)
+        for arg, value_info in zip(inputs, input_value_infos)
+    )
     _nvtx_range_pop()
 
     _nvtx_range_push("push_back_batch")
-
     ort_inputs = _get_ortvalues_from_torch_tensors(inputs, input_devices)
 
     # preallocate output pytorch Tensors and use the buffers affined to the torch device for the output ortvalue.
@@ -395,11 +475,21 @@ def _run_onnx_session_with_ortvaluevector(
     _nvtx_range_pop()
 
     if preallocate_output:
+        _nvtx_range_push("after run_with_ortvaluevector")
+        pth_outputs = tuple(
+            _adjust_scalar_from_onnx_to_fx(onnx_output, prim_output)  # type: ignore[misc]
+            for onnx_output, prim_output in zip(pth_outputs, normalized_prim_outputs)
+        )
+        _nvtx_range_pop()
         return pth_outputs
     else:
         _nvtx_range_push("after run_with_ortvaluevector")
         pth_outputs = onnxruntime.training.ortmodule._utils._ortvalues_to_torch_tensor(
             ort_outputs
+        )
+        pth_outputs = tuple(
+            _adjust_scalar_from_onnx_to_fx(onnx_output, prim_output)  # type: ignore[misc]
+            for onnx_output, prim_output in zip(pth_outputs, normalized_prim_outputs)
         )
         _nvtx_range_pop()
         return pth_outputs
@@ -414,15 +504,29 @@ def _run_onnx_session_with_fetch(
     outputs: Tuple[torch.Tensor, ...],
     output_devices: Tuple["ORTC.OrtDevice", ...],
     preallocate_output: bool,
-) -> Tuple[torch.Tensor, ...]:
+    input_value_infos: Tuple["onnx.ValueInfoProto", ...],  # type: ignore[name-defined]
+    normalized_prim_outputs: Tuple[
+        Union[
+            torch.Tensor, torch.SymInt, int, torch.SymFloat, float, torch.SymBool, bool
+        ],
+        ...,
+    ],
+) -> Tuple[Union[torch.Tensor, int, float, bool], ...]:
+    inputs = tuple(
+        _adjust_scalar_from_fx_to_onnx(arg, value_info)
+        for arg, value_info in zip(inputs, input_value_infos)
+    )
     feed = {
         name: onnxruntime.OrtValue.ortvalue_from_numpy(tensor.cpu().numpy())
         for name, tensor in zip(input_names, inputs)
     }
     ort_outputs = sess.run(output_names, feed)
     pth_outputs = tuple(
-        torch.from_numpy(value).to(tensor.device)
-        for value, tensor in zip(ort_outputs, outputs)
+        _adjust_scalar_from_onnx_to_fx(
+            torch.from_numpy(value),
+            prim_output,
+        )
+        for value, prim_output in zip(ort_outputs, normalized_prim_outputs)
     )
     return pth_outputs
 
@@ -469,8 +573,24 @@ class OrtExecutionInfoPerSession:
         if len(args) != len(self.input_value_infos):
             return False
         for arg, value_info in zip(args, self.input_value_infos):
-            if not isinstance(arg, torch.Tensor):
+            if not isinstance(arg, (torch.Tensor, float, int)):
                 return False
+
+            # Check Python scalars such as int, float, and bool.
+            scalar_to_dtype = {
+                float: _TORCH_DTYPE_TO_ONNX_TENSOR_ELEMENT_TYPE[torch.float],
+                int: _TORCH_DTYPE_TO_ONNX_TENSOR_ELEMENT_TYPE[torch.int64],
+                bool: _TORCH_DTYPE_TO_ONNX_TENSOR_ELEMENT_TYPE[torch.bool],
+            }
+            if isinstance(arg, (int, float, bool)):
+                onnx_dtype = scalar_to_dtype[type(arg)]
+                if onnx_dtype != value_info.type.tensor_type.elem_type:
+                    return False
+                if len(value_info.type.tensor_type.shape.dim) != 0:
+                    return False
+                continue
+
+            # Check tensor.
             onnx_dtype = _TORCH_DTYPE_TO_ONNX_TENSOR_ELEMENT_TYPE[arg.dtype]
             if onnx_dtype != value_info.type.tensor_type.elem_type:
                 return False
@@ -644,7 +764,14 @@ class OrtBackend:
 
         extra_support_dict: Dict[str, Any] = {
             "getattr": None,
+            # To send operator.getitem to ORT, add the corresponding string
+            # recognized by PyTorch's OperatorSupport class.
             "_operator.getitem": None,
+            # To send operator.mul to ORT, add the corresponding string
+            # recognized by PyTorch's OperatorSupport class.
+            "_operator.mul": None,
+            "_operator.add": None,
+            "_operator.sub": None,
         }
 
         self._supported_ops = OrtOperatorSupport(support_dict, extra_support_dict)
@@ -727,6 +854,8 @@ class OrtBackend:
             onnx_session = cached_execution_info_per_session.session
             input_names = cached_execution_info_per_session.input_names
             output_names = cached_execution_info_per_session.output_names
+            input_value_infos = cached_execution_info_per_session.input_value_infos
+            output_value_infos = cached_execution_info_per_session.output_value_infos
             input_devices = cached_execution_info_per_session.input_devices
             output_devices = cached_execution_info_per_session.output_devices
             prim_outputs = cached_execution_info_per_session.example_outputs
@@ -825,12 +954,15 @@ class OrtBackend:
             else:
                 output_devices = _get_onnx_devices((prim_outputs,))
 
+            input_value_infos = tuple(input for input in onnx_model.graph.input)
+            output_value_infos = tuple(output for output in onnx_model.graph.output)
+
             execution_info_per_session = OrtExecutionInfoPerSession(
                 session=onnx_session,
                 input_names=input_names,
-                input_value_infos=tuple(input for input in onnx_model.graph.input),
+                input_value_infos=input_value_infos,
                 output_names=output_names,
-                output_value_infos=tuple(output for output in onnx_model.graph.output),
+                output_value_infos=output_value_infos,
                 input_devices=input_devices,
                 output_devices=output_devices,
                 example_outputs=prim_outputs,
@@ -850,7 +982,10 @@ class OrtBackend:
             (prim_outputs,) if is_single_tensor_output else prim_outputs
         )
         assert isinstance(normalized_prim_outputs, tuple)
-        assert all(isinstance(elem, torch.Tensor) for elem in normalized_prim_outputs)
+        assert all(
+            isinstance(elem, (torch.Tensor, torch.SymInt, int))
+            for elem in normalized_prim_outputs
+        )
 
         _nvtx_range_push("run_onnx_session_with_ortvaluevector")
         onnx_outputs = self.run(
@@ -862,8 +997,11 @@ class OrtBackend:
             normalized_prim_outputs,
             output_devices,
             self._options.preallocate_output,
+            input_value_infos,
+            normalized_prim_outputs,
         )
         _nvtx_range_pop()
+
         if self._assert_allclose_to_baseline:
             # Compute baseline.
             baseline_outputs = torch._prims.executor.execute(
