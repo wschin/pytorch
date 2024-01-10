@@ -358,7 +358,10 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
         class LlamaAttentionWrapper(torch.nn.Module):
             def __init__(self, config):
                 super().__init__()
-                self.attention = LlamaAttention(config)
+                try:
+                    self.attention = LlamaAttention(config, layer_idx=0)
+                except TypeError:
+                    self.attention = LlamaAttention(config)
 
             def forward(self, hidden_states, attention_mask, position_ids):
                 attn_output, _, _ = self.attention(
@@ -445,9 +448,9 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
         class LlamaDecoderWrapper(torch.nn.Module):
             def __init__(self, config):
                 super().__init__()
-                if len(inspect.signature(LlamaDecoderLayer).parameters) == 3:
-                    self.decoder = LlamaDecoderLayer(config, 0)
-                else:
+                try:
+                    self.decoder = LlamaDecoderLayer(config, layer_idx=0)
+                except TypeError:
                     self.decoder = LlamaDecoderLayer(config)
 
             def forward(self, hidden_states, attention_mask, position_ids):
