@@ -61,7 +61,8 @@ DifferentiableViewMeta::DifferentiableViewMeta(
 ViewInfo ViewInfo::chain(
     const Variable& base,
     const Variable& tensor,
-    std::function<Variable(const Variable&)> view_func) const {
+    std::function<Variable(const Variable&)> view_func,
+    std::function<Variable(const Variable&)> rev_view_func) const {
   // Set `view_func` using the root base as input.
   // `view_func` is used to recover views in backward when either as_strided is
   // not supported or the view function changes the metadata which is not
@@ -77,6 +78,13 @@ ViewInfo ViewInfo::chain(
         auto temp = prev_fn(root_base);
         return view_func(temp);
       };
+
+      // assume view_fn_ / rev_view_fn_ always exist together or neither are set
+      auto prev_rev_fn = rev_view_fn_;
+      rev_view_func = [=](const at::Tensor& root_view) {
+        auto temp = rev_view_func(root_view);
+        return prev_rev_fn(temp);
+      };
     } else {
       // current_view has a view_func and but it's parent doesn't have one
       if (base.unsafeGetTensorImpl()->support_as_strided()) {
@@ -87,22 +95,34 @@ ViewInfo ViewInfo::chain(
           auto temp = root_base.as_strided_symint(size, stride, storage_offset);
           return view_func(temp);
         };
+
+        // assume view_fn_ / rev_view_fn_ always exist together or neither are
+        // set
+        const auto& root_base = base._base();
+        auto root_base_size = root_base.sym_sizes().vec();
+        auto root_base_stride = root_base.sym_strides().vec();
+        auto root_base_storage_offset = root_base.sym_storage_offset();
+        rev_view_func = [=](const at::Tensor& root_view) {
+          auto temp = rev_view_func(root_view);
+          return temp.as_strided_symint(
+              root_base_size, root_base_stride, root_base_storage_offset);
+        };
       } else {
-        // When base is a view but doesn't carry a view_fn in
-        // DifferentiableViewMeta, it's a view that doesn't support inplace
-        // update, e.g. unbind. In this case we should throw an error when
-        // inplace update happens in **forward**. One would naturally think the
-        // following function will be first called in backward pass. But the
-        // first call site is indeed in **forward** pass when we refresh
-        // `grad_fn` triggered by inplace update. Search Note [View + Inplace
-        // update for view tensor] to for the call site.
+        // This case should be relatively rare: parent view doesn't have a
+        // view_func() AND as_strided() isn't supported; there's no obvious way
+        // to chain the two views.
+        auto error_msg =
+            ("Attempted to chain views when the parent view has no view_func() and "
+             "does not support as_strided(). This is not supported.");
+
         view_func = [=](const at::Tensor& root_base) {
-          TORCH_CHECK(
-              false,
-              "This view is the output of a function that returns multiple views."
-              "Such functions do not allow the output views to be modified inplace."
-              "You should replace the inplace operation by an out-of-place one");
+          TORCH_CHECK(false, error_msg);
           return root_base;
+        };
+
+        rev_view_func = [=](const at::Tensor& root_view) {
+          TORCH_CHECK(false, error_msg);
+          return root_view;
         };
       }
     }
@@ -117,9 +137,20 @@ ViewInfo ViewInfo::chain(
       auto temp = prev_view_fn(root_base);
       return temp.as_strided_symint(size, stride, storage_offset);
     };
+
+    // assume view_fn_ / rev_view_fn_ always exist together or neither are set
+    auto prev_rev_view_fn = rev_view_fn_;
+    auto base_size = base.sym_sizes().vec();
+    auto base_stride = base.sym_strides().vec();
+    auto base_storage_offset = base.sym_storage_offset();
+    rev_view_func = [=](const at::Tensor& root_view) {
+      auto temp = root_view.as_strided_symint(
+          base_size, base_stride, base_storage_offset);
+      return prev_rev_view_fn(temp);
+    };
   }
 
-  return ViewInfo(base_, std::move(view_func));
+  return ViewInfo(base_, std::move(view_func), std::move(rev_view_func));
 }
 
 namespace {
@@ -226,7 +257,6 @@ void create_cpp_hook(const at::TensorBase& self, bool is_retains_grad_hook) {
   const auto& fn = self.grad_fn();
   std::shared_ptr<hooks_list>& list =
       materialize_autograd_meta(self)->cpp_hooks_list_;
-  // NOLINTNEXTLINE(modernize-make-shared)
   list.reset(new hooks_list());
   std::unique_ptr<FunctionPreHook> hook_ptr{
       new CppFunctionTensorPreHook(list, self.output_nr())};
@@ -361,6 +391,19 @@ std::vector<std::unique_ptr<FunctionPreHook>>& hooks(const Variable& self) {
 void clear_hooks(const at::TensorBase& self) {
   // This is a little goofy, but usually this should be a no oop
   materialize_autograd_meta(self)->hooks_.clear();
+}
+
+void set_post_acc_grad_hooks(
+    const at::TensorBase& self,
+    std::unique_ptr<PostAccumulateGradHook> dict) {
+  AutogradMeta* meta = materialize_autograd_meta(self);
+  meta->post_acc_grad_hooks_ = std::move(dict);
+}
+
+std::unique_ptr<PostAccumulateGradHook>& post_acc_grad_hooks(
+    const Variable& self) {
+  TORCH_INTERNAL_ASSERT(get_autograd_meta(self));
+  return get_autograd_meta(self)->post_acc_grad_hooks_;
 }
 
 void set_name(const Variable& self, const std::string& name) {
@@ -672,7 +715,8 @@ const std::shared_ptr<torch::autograd::Node>& VariableHooks::grad_fn(
             view_info.base_.options(),
             self.sym_sizes(), // Note: sizes(), not base_.sizes(), is
                               // intentional
-            self.unsafeGetTensorImpl()->is_python_dispatch());
+            self.unsafeGetTensorImpl()->is_python_dispatch(),
+            self.is_nested());
         diff_view_meta->grad_fn_ = std::move(fn);
       }
       diff_view_meta->set_attr_version(current_version);
@@ -711,7 +755,7 @@ unsigned VariableHooks::_register_hook(
   auto& list = torch::autograd::impl::get_autograd_meta(self)->cpp_hooks_list_;
   if (!list) {
     torch::autograd::impl::create_cpp_hook(
-        self, /*is_retains_grad_hook=*/false);
+        self, /*is_retains_grad_hooks=*/false);
   }
   unsigned idx = list->size();
   list->push_back(hook);

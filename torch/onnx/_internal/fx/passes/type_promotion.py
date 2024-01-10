@@ -73,11 +73,14 @@ class TypePromotionSnapshot:
 def _fake_tensor_from_node_val(node: torch.fx.Node) -> fake_tensor.FakeTensor:
     """Syntactic sugar for retrieving fake tensor from node.meta['val']."""
     val = node.meta.get("val", None)
-    if not isinstance(val, fake_tensor.FakeTensor):
+    if isinstance(val, fake_tensor.FakeTensor):
+        return val
+    elif isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+        return val.node.hint
+    else:
         raise RuntimeError(
             f"Cannot retrieve fake tensor from node {node}. Got type({type(val)}) instead."
         )
-    return val
 
 
 class TypePromotionRule(abc.ABC):
@@ -99,7 +102,7 @@ class TypePromotionRule(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def __eq__(self, other: Any) -> bool:
+    def __eq__(self, other: object) -> bool:
         ...
 
     def is_valid(self) -> bool:
@@ -137,6 +140,12 @@ class TypePromotionRule(abc.ABC):
 
 class ElementwiseTypePromotionRule(TypePromotionRule):
     """Defines how to perform elementwise type promotion for 'torch.ops.{namespace}.{op_name}'."""
+
+    _USE_OPMATH: bool = False
+    """Whether to use opmath to compute the promoted input dtype.
+    If used, upcasts will be inserted everywhere for lower precision models.
+    Set to False and have torchlib handle upcasts in op implementation internally.
+    """
 
     def __init__(
         self,
@@ -180,6 +189,23 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
     def __hash__(self) -> int:
         return f"{type(self)}:{self.namespace}.{self.op_name}".__hash__()
 
+    def _consolidate_input_dtype(
+        self, computed_dtype: torch.dtype, result_dtype: torch.dtype
+    ) -> torch.dtype:
+        """
+        Although opmath is the right thing to do to retain on-par precision, it inserts
+        upcasts everywhere in the graph. This is particularly hard for backend to optimize
+        since there is no way to differentiate between inserted upcasts and model code
+        casts. Hence we consolidate the input dtype to the result dtype to avoid this.
+        """
+        if (
+            not self._USE_OPMATH
+            and self.promotion_kind
+            == _prims_common.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+        ):
+            return result_dtype
+        return computed_dtype
+
     def preview_type_promotion(
         self, args: tuple, kwargs: dict
     ) -> TypePromotionSnapshot:
@@ -195,14 +221,17 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
         }
 
         computed_dtype, result_dtype = _prims_common.elementwise_dtypes(
-            *_pytree.tree_flatten(candidate_args)[0],
-            *_pytree.tree_flatten(candidate_kwargs)[0],
+            *_pytree.arg_tree_leaves(*candidate_args.values(), **candidate_kwargs),
             type_promotion_kind=self.promotion_kind,
         )
 
+        consolidated_input_dtype = self._consolidate_input_dtype(
+            computed_dtype, result_dtype
+        )
+
         return TypePromotionSnapshot(
-            {i: computed_dtype for i in candidate_args.keys()},
-            {name: computed_dtype for name in candidate_kwargs.keys()},
+            {i: consolidated_input_dtype for i in candidate_args.keys()},
+            {name: consolidated_input_dtype for name in candidate_kwargs.keys()},
             result_dtype,
         )
 
@@ -912,6 +941,9 @@ _GENERATED_ATEN_TYPE_PROMOTION_RULE_SET = {
         "aten", "rsqrt_", [0], [], ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
     ),
     ElementwiseTypePromotionRule(
+        "aten", "rsub", [0, 1], [], ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+    ),
+    ElementwiseTypePromotionRule(
         "aten", "selu", [0], [], ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
     ),
     ElementwiseTypePromotionRule(
@@ -1260,7 +1292,7 @@ def get_type_promotion_rule(
         )
         return None
 
-    diagnostic.with_additional_message(f"Found type promotion rule: {rule}")
+    diagnostic.info("Found type promotion rule: %s", rule)
     return rule
 
 
@@ -1436,9 +1468,12 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
                     )
                     node.replace_all_uses_with(output_cast_node)
                     output_cast_node.args = (node,)
-                    diagnostic.with_additional_message(
-                        f"Node '{node}' output dtype becomes {new_node_val.dtype} due to op math. "
-                        f"Cast back to {expected_out_dtype}."
+                    diagnostic.info(
+                        "Node '%s' output dtype becomes %s due to op math. "
+                        "Cast back to %s.",
+                        node,
+                        new_node_val.dtype,
+                        expected_out_dtype,
                     )
 
         elif fx_type_utils.is_torch_symbolic_type(node_val):
@@ -1462,8 +1497,9 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
     ) -> torch.fx.node.Argument:
         """Promote fx_arg to dtype if necessary."""
         if dtype is None:
-            diagnostic.with_additional_message(
-                f"Argument {fx_arg} is not promoted. Not mentioned by type promotion rule."
+            diagnostic.info(
+                "Argument %s is not promoted. Not mentioned by type promotion rule.",
+                fx_arg,
             )
             return fx_arg
 
@@ -1474,8 +1510,11 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
                     # Promote tensor to dtype.
                     graph = node.graph
                     with graph.inserting_before(node):
-                        diagnostic.with_additional_message(
-                            f"Argument {fx_arg}({old_dtype}) is promoted to {dtype}."
+                        diagnostic.info(
+                            "Argument %s(%s) is promoted to %s.",
+                            fx_arg,
+                            old_dtype,
+                            dtype,
                         )
                         return self._create_node(
                             graph,
@@ -1484,8 +1523,8 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
                             (fx_arg,),
                             {"dtype": dtype},
                         )
-                diagnostic.with_additional_message(
-                    f"Argument {fx_arg} is not promoted. Already {dtype}."
+                diagnostic.info(
+                    "Argument %s is not promoted. Already %s.", fx_arg, dtype
                 )
                 return fx_arg
             elif fx_type_utils.is_torch_symbolic_type(arg_val):
@@ -1498,9 +1537,12 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
                     # Promote Sym number to tensor of dtype.
                     graph = node.graph
                     with graph.inserting_before(node):
-                        diagnostic.with_additional_message(
-                            f"Argument {fx_arg}(Scalar of equivalent dtype: {equivalent_dtype}) "
-                            f"is promoted to {dtype}."
+                        diagnostic.info(
+                            "Argument %s(Scalar of equivalent dtype: %s) "
+                            "is promoted to %s.",
+                            fx_arg,
+                            equivalent_dtype,
+                            dtype,
                         )
                         return self._create_node(
                             graph,
@@ -1509,8 +1551,8 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
                             (fx_arg,),
                             {"dtype": dtype},
                         )
-                diagnostic.with_additional_message(
-                    f"Argument {fx_arg} is not promoted. Already {dtype}."
+                diagnostic.info(
+                    "Argument %s is not promoted. Already %s.", fx_arg, dtype
                 )
                 return fx_arg
         elif (
@@ -1524,9 +1566,12 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
                 # the type promotion rule should not suggest promoting this arg.
                 graph = node.graph
                 with graph.inserting_before(node):
-                    diagnostic.with_additional_message(
-                        f"Argument {fx_arg}(Scalar of equivalent dtype: {equivalent_dtype}) "
-                        f"is promoted to {dtype}."
+                    diagnostic.info(
+                        "Argument %s(Scalar of equivalent dtype: %s) "
+                        "is promoted to %s.",
+                        fx_arg,
+                        equivalent_dtype,
+                        dtype,
                     )
                     return self._create_node(
                         graph,
@@ -1535,13 +1580,11 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
                         (fx_arg,),
                         {"dtype": dtype},
                     )
-            diagnostic.with_additional_message(
-                f"Argument {fx_arg} is not promoted. Already {dtype}."
-            )
+            diagnostic.info("Argument %s is not promoted. Already %s.", fx_arg, dtype)
             return fx_arg
         elif isinstance(fx_arg, (tuple, list)):
-            diagnostic.with_additional_message(
-                f"Argument {fx_arg} is a tuple/list. Promoting each element."
+            diagnostic.info(
+                "Argument %s is a tuple/list. Promoting each element.", fx_arg
             )
             return type(fx_arg)(
                 self._maybe_promote_arg(diagnostic, node, fx_arg_elem, dtype)
@@ -1630,7 +1673,7 @@ class InsertTypePromotion(_pass.Transform):
     metadata, specifically the fake tensor stored under node.meta["val"], and ensure it
     reflects the latest changes.
 
-    See [FXE0015: fx_node_insert_type_promotion](https://pytorch.org/docs/master/generated/onnx_diagnostics_rules/FXE0015%3Afx-node-insert-type-promotion.html) for more details.  # noqa: B950
+    See [FXE0015: fx_node_insert_type_promotion](https://pytorch.org/docs/master/generated/onnx_dynamo_diagnostics_rules/FXE0015%3Afx-node-insert-type-promotion.html) for more details.  # noqa: B950
     """
 
     def __init__(
@@ -1683,7 +1726,9 @@ class InsertTypePromotion(_pass.Transform):
         fake_mode = self.fake_mode
         assert fake_mode is not None, "Cannot detect fake_mode."
 
-        with fake_mode, fx_traceback.preserve_node_meta():
+        with proxy_tensor.maybe_disable_fake_tensor_mode(), (
+            fake_mode
+        ), fx_traceback.preserve_node_meta():
             self.interpreter.run(*fake_args)
 
         return self.module

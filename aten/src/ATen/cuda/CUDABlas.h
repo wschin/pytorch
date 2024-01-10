@@ -16,9 +16,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/OpMathType.h>
 
-namespace at {
-namespace cuda {
-namespace blas {
+namespace at::cuda::blas {
 
 // RAII guard that sets the CuBLAS pointer mode and restores it to
 // its previous value when the guard is destroyed
@@ -64,7 +62,7 @@ void gemm<at::Half>(CUDABLAS_GEMM_ARGTYPES(at::Half));
 template <>
 void gemm<at::BFloat16>(CUDABLAS_GEMM_ARGTYPES(at::BFloat16));
 
-#if !defined(USE_ROCM) && !defined(_MSC_VER)
+#if (!defined(USE_ROCM) && !defined(_MSC_VER)) || (defined(USE_ROCM) && ROCM_VERSION >= 50700)
 enum GEMMAndBiasActivationEpilogue {
   None,
   RELU,
@@ -102,6 +100,29 @@ void int8_gemm(
     int64_t mat2_ld,
     int32_t* result_ptr,
     int64_t result_ld);
+
+void scaled_gemm(
+    char transa,
+    char transb,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    const void* mat1_ptr,
+    const void* mat1_scale_ptr,
+    int64_t mat1_ld,
+    ScalarType mat1_dtype,
+    const void* mat2_ptr,
+    const void* mat2_scale_ptr,
+    int64_t mat2_ld,
+    ScalarType mat2_dtype,
+    const void* bias_ptr,
+    ScalarType bias_dtype,
+    void* result_ptr,
+    const void* result_scale_ptr,
+    int64_t result_ld,
+    ScalarType result_dtype,
+    void* amax_ptr,
+    bool use_fast_accum);
 #endif
 
 #define CUDABLAS_BGEMM_ARGTYPES(Dtype)                                                        \
@@ -128,7 +149,7 @@ void bgemm<at::Half>(CUDABLAS_BGEMM_ARGTYPES(at::Half));
 template <>
 void bgemm<at::BFloat16>(CUDABLAS_BGEMM_ARGTYPES(at::BFloat16));
 
-#if defined(USE_ROCM) && ROCM_VERSION <= 55000
+#if defined(USE_ROCM) && ROCM_VERSION <= 50500
 // ROCm 5.6 hipblas matches the const Dtype *A API, but prior hipblas does not.
 #define CUDABLAS_TRSM_ARGTYPES(Dtype)                                  \
   hipblasHandle_t handle, hipblasSideMode_t side, hipblasFillMode_t uplo, \
@@ -310,6 +331,4 @@ TORCH_CUDA_CU_API void gelsBatched<c10::complex<double>>(CUDABLAS_GELS_BATCHED_A
 template<>
 TORCH_CUDA_CU_API void gelsBatched<c10::complex<float>>(CUDABLAS_GELS_BATCHED_ARGTYPES(c10::complex<float>));
 
-} // namespace blas
-} // namespace cuda
-} // namespace at
+} // namespace at::cuda::blas

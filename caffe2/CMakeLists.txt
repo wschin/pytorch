@@ -64,7 +64,7 @@ if(INTERN_BUILD_ATEN_OPS)
   "${PYTHON_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/contrib/aten/gen_op.py
     --aten_root=${CMAKE_CURRENT_SOURCE_DIR}/../aten
     --template_dir=${CMAKE_CURRENT_SOURCE_DIR}/contrib/aten
-    --yaml_dir=${CMAKE_CURRENT_BINARY_DIR}/../aten/src/ATen
+    --yaml_dir=${CMAKE_BINARY_DIR}/aten/src/ATen
     --install_dir=${CMAKE_CURRENT_BINARY_DIR}/contrib/aten
   DEPENDS
   ${torchgen_python}
@@ -400,6 +400,7 @@ set(GENERATED_CXX_PYTHON
 
 set(GENERATED_H_PYTHON
   "${TORCH_SRC_DIR}/csrc/autograd/generated/python_functions.h"
+  "${TORCH_SRC_DIR}/csrc/autograd/generated/python_return_types.h"
   )
 
 set(GENERATED_TESTING_PYTHON
@@ -532,7 +533,7 @@ if(NOT MSVC)
   set_source_files_properties(${TORCH_SRC_DIR}/csrc/jit/tensorexpr/llvm_jit.cpp PROPERTIES COMPILE_FLAGS -Wno-noexcept-type)
 endif()
 # Disable certain warnings for GCC-9.X
-if(CMAKE_COMPILER_IS_GNUCXX AND (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 9.0.0))
+if(CMAKE_COMPILER_IS_GNUCXX)
   # See https://github.com/pytorch/pytorch/issues/38856
   set_source_files_properties(${TORCH_SRC_DIR}/csrc/jit/tensorexpr/llvm_jit.cpp PROPERTIES COMPILE_FLAGS "-Wno-redundant-move -Wno-noexcept-type")
   set_source_files_properties(${TORCH_SRC_DIR}/csrc/jit/tensorexpr/llvm_codegen.cpp PROPERTIES COMPILE_FLAGS "-Wno-init-list-lifetime")
@@ -630,8 +631,7 @@ if(USE_CUDA)
     set(DELAY_LOAD_FLAGS "")
   endif()
 
-  target_link_libraries(caffe2_nvrtc ${CUDA_NVRTC} ${CUDA_CUDA_LIB} ${CUDA_NVRTC_LIB} ${DELAY_LOAD_FLAGS})
-  target_include_directories(caffe2_nvrtc PRIVATE ${CUDA_INCLUDE_DIRS})
+  target_link_libraries(caffe2_nvrtc ${CUDA_CUDA_LIB} ${CUDA_NVRTC_LIB} ${DELAY_LOAD_FLAGS})
   install(TARGETS caffe2_nvrtc DESTINATION "${TORCH_INSTALL_LIB_DIR}")
   if(USE_NCCL)
     list(APPEND Caffe2_GPU_SRCS
@@ -641,6 +641,10 @@ if(USE_CUDA)
     append_filelist("libtorch_cuda_distributed_base_sources" Caffe2_GPU_SRCS)
     if(NOT WIN32)
       append_filelist("libtorch_cuda_distributed_extra_sources" Caffe2_GPU_SRCS)
+      set_source_files_properties(
+        ${TORCH_SRC_DIR}/csrc/distributed/c10d/intra_node_comm.cpp
+        PROPERTIES COMPILE_FLAGS "-DPYTORCH_C10_DRIVER_API_SUPPORTED=1"
+      )
     endif()
   endif()
   set_source_files_properties(
@@ -692,8 +696,9 @@ if(USE_ROCM)
   # caffe2_nvrtc's stubs to driver APIs are useful for HIP.
   # See NOTE [ ATen NVRTC Stub and HIP ]
   add_library(caffe2_nvrtc SHARED ${ATen_NVRTC_STUB_SRCS})
-  target_link_libraries(caffe2_nvrtc ${PYTORCH_HIP_HCC_LIBRARIES} ${ROCM_HIPRTC_LIB})
-  target_compile_definitions(caffe2_nvrtc PRIVATE USE_ROCM __HIP_PLATFORM_HCC__)
+  target_link_libraries(caffe2_nvrtc ${PYTORCH_HIP_LIBRARIES} ${ROCM_HIPRTC_LIB})
+  target_include_directories(caffe2_nvrtc PRIVATE ${CMAKE_BINARY_DIR})
+  target_compile_definitions(caffe2_nvrtc PRIVATE USE_ROCM __HIP_PLATFORM_AMD__)
   install(TARGETS caffe2_nvrtc DESTINATION "${TORCH_INSTALL_LIB_DIR}")
 endif()
 
@@ -822,7 +827,13 @@ if(BUILD_CAFFE2 AND NOT MSVC)
   target_compile_options(torch_cpu PRIVATE "-Wno-sign-compare")
 endif()
 
-if("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang" AND NOT USE_VULKAN AND NOT USE_IOS AND NOT USE_PYTORCH_METAL AND NOT USE_MPS AND NOT USE_COREML_DELEGATE)
+# Ignore Wdeprecated-XXX errors from third-party libraries
+if(NOT MSVC)
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/aten/src/ATen/native/QuantizedLinear.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=deprecated")
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/torch/csrc/distributed/c10d/socket.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=deprecated")
+endif()
+
+if("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang" AND NOT USE_VULKAN AND NOT USE_IOS AND NOT USE_PYTORCH_METAL AND NOT USE_COREML_DELEGATE)
   target_compile_options_if_supported(torch_cpu "-Wmissing-prototypes")
   target_compile_options_if_supported(torch_cpu "-Werror=missing-prototypes")
   get_target_property(TORCH_CPU_SOURCES torch_cpu SOURCES)
@@ -843,8 +854,29 @@ if("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang" AND NOT USE_VULKAN AND NOT USE_IOS
   endforeach()
 endif()
 
+option(TORCH_USE_IWYU "Use include-what-you-use to clean up header inclusion" OFF)
+if(TORCH_USE_IWYU)
+  find_program(iwyu NAMES include-what-you-use)
+  if(iwyu)
+    set(iwyu_cmd
+        "include-what-you-use"
+        "-Xiwyu"
+        "--transitive_includes_only"
+        "-Xiwyu"
+        "--no_fwd_decls"
+        "-Xiwyu"
+        "--prefix_header_includes=keep"
+        "-Xiwyu"
+        "--mapping_file=${CMAKE_CURRENT_LIST_DIR}/../tools/iwyu/all.imp"
+        )
+    set_property(TARGET torch_cpu PROPERTY CXX_INCLUDE_WHAT_YOU_USE ${iwyu_cmd})
+  endif()
+endif()
+
 set_property(SOURCE ${ATen_CORE_SRCS} APPEND
     PROPERTY COMPILE_DEFINITIONS "TORCH_ASSERT_ONLY_METHOD_OPERATORS")
+set_property(SOURCE ${ATen_ATTENTION_KERNEL_SRCS} APPEND
+    PROPERTY COMPILE_DEFINITIONS "TORCH_ASSERT_NO_OPERATORS")
 
 if(USE_MPS OR USE_PYTORCH_METAL)
   enable_language(OBJC OBJCXX)
@@ -923,6 +955,9 @@ endif()
 if(USE_ROCM)
   set(CUDA_LINK_LIBRARIES_KEYWORD PRIVATE)
   hip_add_library(torch_hip ${Caffe2_HIP_SRCS})
+  if(USE_FLASH_ATTENTION)
+    target_link_libraries(torch_hip PRIVATE __caffe2_oort)
+  endif()
   set(CUDA_LINK_LIBRARIES_KEYWORD)
   torch_compile_options(torch_hip)  # see cmake/public/utils.cmake
   # TODO: Not totally sure if this is live or not
@@ -955,6 +990,7 @@ elseif(USE_CUDA)
   endif()
   set(CUDA_LINK_LIBRARIES_KEYWORD)
   torch_compile_options(torch_cuda)  # see cmake/public/utils.cmake
+  target_compile_options_if_supported(torch_cuda "-Wno-deprecated-copy")  # see cmake/public/utils.cmake
   target_compile_definitions(torch_cuda PRIVATE USE_CUDA)
 
   if(USE_CUSPARSELT)
@@ -971,6 +1007,9 @@ elseif(USE_CUDA)
   endif()
   if(USE_FLASH_ATTENTION)
     target_compile_definitions(torch_cuda PRIVATE USE_FLASH_ATTENTION)
+  endif()
+  if(USE_MEM_EFF_ATTENTION)
+    target_compile_definitions(torch_cuda PRIVATE USE_MEM_EFF_ATTENTION)
   endif()
   if(BUILD_LAZY_CUDA_LINALG)
     add_library(torch_cuda_linalg ${ATen_CUDA_LINALG_SRCS})
@@ -1247,21 +1286,21 @@ endif()
 if(USE_ROCM)
   target_compile_definitions(torch_hip PRIVATE
     USE_ROCM
-    __HIP_PLATFORM_HCC__
+    __HIP_PLATFORM_AMD__
     )
   # NB: Massive hack.  torch/csrc/jit/codegen/fuser/codegen.cpp includes
   # torch/csrc/jit/codegen/fuser/cuda/resource_strings.h which changes the
-  # strings depending on if you're __HIP_PLATFORM_HCC__ or not.
+  # strings depending on if you're __HIP_PLATFORM_AMD__ or not.
   # But that file is in torch_cpu!  So, against all odds, this macro
   # has to be set on torch_cpu too.  I also added it to torch for
   # better luck
   target_compile_definitions(torch_cpu PRIVATE
     USE_ROCM
-    __HIP_PLATFORM_HCC__
+    __HIP_PLATFORM_AMD__
     )
   target_compile_definitions(torch PRIVATE
     USE_ROCM
-    __HIP_PLATFORM_HCC__
+    __HIP_PLATFORM_AMD__
     )
   target_include_directories(torch_hip PRIVATE
     /opt/rocm/include
@@ -1269,6 +1308,9 @@ if(USE_ROCM)
     /opt/rocm/rocblas/include
     /opt/rocm/hipsparse/include
     )
+  if(USE_FLASH_ATTENTION)
+    target_compile_definitions(torch_hip PRIVATE USE_FLASH_ATTENTION)
+  endif()
 endif()
 
 if(BUILD_LITE_INTERPRETER)
@@ -1298,9 +1340,6 @@ if(USE_DISTRIBUTED)
       target_compile_definitions(torch_hip PUBLIC USE_C10D_NCCL)
     else()
       target_compile_definitions(torch_cuda PUBLIC USE_C10D_NCCL)
-      if(USE_NCCL_WITH_UCC)
-        target_compile_definitions(torch_cuda PUBLIC USE_NCCL_WITH_UCC)
-      endif()
     endif()
   endif()
   if(USE_MPI AND USE_C10D_MPI)
@@ -1367,6 +1406,9 @@ target_link_libraries(torch_cpu PUBLIC c10)
 target_link_libraries(torch_cpu PUBLIC ${Caffe2_PUBLIC_DEPENDENCY_LIBS})
 target_link_libraries(torch_cpu PRIVATE ${Caffe2_DEPENDENCY_LIBS})
 target_link_libraries(torch_cpu PRIVATE ${Caffe2_DEPENDENCY_WHOLE_LINK_LIBS})
+if(USE_MPI)
+  target_link_libraries(torch_cpu PRIVATE MPI::MPI_CXX)
+endif()
 target_include_directories(torch_cpu INTERFACE $<INSTALL_INTERFACE:include>)
 target_include_directories(torch_cpu PRIVATE ${Caffe2_CPU_INCLUDE})
 target_include_directories(torch_cpu SYSTEM PRIVATE "${Caffe2_DEPENDENCY_INCLUDE}")
@@ -1376,12 +1418,6 @@ if(USE_CUDA)
   target_compile_definitions(torch_cuda PRIVATE TORCH_CUDA_BUILD_MAIN_LIB)
 elseif(USE_ROCM)
   target_compile_definitions(torch_hip PRIVATE TORCH_HIP_BUILD_MAIN_LIB)
-endif()
-
-if(USE_EXPERIMENTAL_CUDNN_V8_API)
-  if(USE_CUDA)
-    target_compile_definitions(torch_cuda PRIVATE "-DUSE_EXPERIMENTAL_CUDNN_V8_API")
-  endif()
 endif()
 
 set(EXPERIMENTAL_SINGLE_THREAD_POOL "0" CACHE STRING
@@ -1437,7 +1473,7 @@ if(MSVC AND NOT BUILD_SHARED_LIBS)
   #   1. Write out a config.h header which stores whether or not
   #      you are linking statically or dynamically.
   #
-  #   2. Force all of users to set the the macro themselves.  If they
+  #   2. Force all of users to set the macro themselves.  If they
   #      use cmake, you can set -DAT_CORE_STATIC_WINDOWS=1 as a PUBLIC
   #      compile option, in which case cmake will automatically
   #      add the macro for you.
@@ -1562,9 +1598,11 @@ if(BUILD_SHARED_LIBS)
   endif()
   set_target_properties(torch_global_deps PROPERTIES LINKER_LANGUAGE C)
   if(USE_MPI)
-      target_link_libraries(torch_global_deps ${MPI_CXX_LIBRARIES})
+    target_link_libraries(torch_global_deps MPI::MPI_CXX)
   endif()
-  target_link_libraries(torch_global_deps ${MKL_LIBRARIES})
+  if(CAFFE2_USE_MKL)
+    target_link_libraries(torch_global_deps caffe2::mkl)
+  endif()
   # The CUDA libraries are linked here for a different reason: in some
   # cases we load these libraries with ctypes, and if they weren't opened
   # with RTLD_GLOBAL, we'll do the "normal" search process again (and
@@ -1622,14 +1660,6 @@ if(BUILD_STATIC_RUNTIME_BENCHMARK)
   target_link_libraries(static_runtime_test torch_library gtest_main)
 endif()
 
-if(BUILD_TENSOREXPR_BENCHMARK)
-  add_subdirectory(${TORCH_ROOT}/benchmarks/cpp/tensorexpr ${CMAKE_BINARY_DIR}/tensorexpr_bench)
-endif()
-
-if(BUILD_CPP_BENCHMARKS)
-  add_subdirectory(${TORCH_ROOT}/benchmarks/cpp ${PROJECT_BINARY_DIR}/bin)
-endif()
-
 if(BUILD_MOBILE_BENCHMARK)
   foreach(benchmark_src ${ATen_MOBILE_BENCHMARK_SRCS})
     get_filename_component(benchmark_name ${benchmark_src} NAME_WE)
@@ -1670,6 +1700,14 @@ if(BUILD_TEST)
           target_link_libraries(${test_name}_${CPU_CAPABILITY} c10 sleef gtest_main)
           if(USE_FBGEMM)
             target_link_libraries(${test_name}_${CPU_CAPABILITY} fbgemm)
+          endif()
+          if(USE_ASAN)
+            if(TARGET Sanitizer::address)
+              target_link_libraries(${test_name}_${CPU_CAPABILITY} Sanitizer::address)
+            endif()
+            if(TARGET Sanitizer::undefined)
+              target_link_libraries(${test_name}_${CPU_CAPABILITY} Sanitizer::undefined)
+            endif()
           endif()
         else()
           add_executable(${test_name}_${CPU_CAPABILITY} "${test_src}")
@@ -1733,6 +1771,9 @@ if(BUILD_TEST)
       get_filename_component(test_name ${test_src} NAME_WE)
       add_executable(${test_name} "${test_src}")
       target_link_libraries(${test_name} torch_library gtest_main)
+      if(USE_CUDNN AND ${test_name} MATCHES "cudnn")
+        target_link_libraries(${test_name} torch::cudnn)
+      endif()
       target_include_directories(${test_name} PRIVATE $<INSTALL_INTERFACE:include>)
       target_include_directories(${test_name} PRIVATE ${Caffe2_CPU_INCLUDE})
       add_test(NAME ${test_name} COMMAND $<TARGET_FILE:${test_name}>)
@@ -1781,9 +1822,9 @@ if(BUILD_TEST)
 
   # For special tests that explicitly uses dependencies, we add them here
   if(BUILD_CAFFE2 AND USE_MPI)
-    target_link_libraries(mpi_test ${MPI_CXX_LIBRARIES})
+    target_link_libraries(mpi_test MPI::MPI_CXX)
     if(USE_CUDA)
-      target_link_libraries(mpi_gpu_test ${MPI_CXX_LIBRARIES})
+      target_link_libraries(mpi_gpu_test MPI::MPI_CXX)
     endif()
   endif()
 endif()

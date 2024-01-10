@@ -1,7 +1,7 @@
 # Owner(s): ["module: meta tensors"]
 
 from torch.testing._internal.common_utils import (
-    TestCase, run_tests, skipIfCrossRef, skipIfRocm, skipIfTorchDynamo, parametrize,
+    TestCase, TEST_WITH_TORCHDYNAMO, run_tests, skipIfCrossRef, skipIfRocm, skipIfTorchDynamo, parametrize,
     instantiate_parametrized_tests)
 import torch
 import torch._dynamo
@@ -15,14 +15,15 @@ from torch._subclasses.fake_tensor import (
     DynamicOutputShapeException,
     UnsupportedOperatorException,
 )
+from torch.fx.experimental.symbolic_shapes import ShapeEnv, DimDynamic, free_symbols, StatelessSymbolicContext
 from torch.testing._internal.custom_op_db import custom_op_db
 from torch.testing._internal.common_device_type import ops
 from torch.testing._internal.common_device_type import instantiate_device_type_tests, OpDTypes
-from torch.testing._internal.common_cuda import SM80OrLater, PLATFORM_SUPPORTS_FUSED_SDPA
+from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch._dynamo.testing import rand_strided
+from torch._C._functorch import is_batchedtensor, _add_batch_dim, get_unwrapped
 from torch.testing import FileCheck
-from torch import nn
 import unittest
 import torch._prims as prims
 import contextlib
@@ -35,7 +36,7 @@ from unittest.mock import patch
 from torch import distributed as dist
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_flatten
+import torch.utils._pytree as pytree
 
 class FakeTensorTest(TestCase):
     def checkType(self, t, device_str, size):
@@ -98,7 +99,7 @@ class FakeTensorTest(TestCase):
 
     @unittest.skipIf(not dist.is_available(), "requires distributed")
     def test_fsdp_flat_param(self):
-        from torch.distributed.fsdp.flat_param import FlatParameter
+        from torch.distributed.fsdp._flat_param import FlatParameter
         with FakeTensorMode() as m:
             data = torch.randn(2, 2)
             param = FlatParameter(data, requires_grad=True)
@@ -112,6 +113,7 @@ class FakeTensorTest(TestCase):
         fake_t = mode.from_tensor(t)
         self.assertEqual(fake_t.requires_grad, t.requires_grad)
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_index_cuda_with_cpu(self):
         with FakeTensorMode():
@@ -200,6 +202,23 @@ class FakeTensorTest(TestCase):
                 FileCheck().check("CPU").check("AutocastCPU").run(torch._C._dispatch_key_set(y))
                 FileCheck().check_not("ADInplaceOrView").check_not("Autograd").run(torch._C._dispatch_key_set(y))
 
+    def test_batch_tensor(self):
+        x = torch.rand((3, 4, 5))
+        b = _add_batch_dim(x, 0, 0)
+        mode = FakeTensorMode()
+        fake_b = mode.from_tensor(b)
+        prims.utils.compare_tensor_meta(b, fake_b, check_strides=True)
+
+        b1 = _add_batch_dim(x, 1, 1)
+        b2 = _add_batch_dim(b1, 0, 2)
+        fake_b2 = mode.from_tensor(b2)
+        prims.utils.compare_tensor_meta(b2, fake_b2, check_strides=True)
+        self.assertTrue(is_batchedtensor(fake_b2))
+        fake_b1 = get_unwrapped(fake_b2)
+        self.assertTrue(is_batchedtensor(fake_b1))
+        fake_tensor = get_unwrapped(fake_b1)
+        self.assertIsInstance(fake_tensor, FakeTensor)
+
     def test_constructor(self):
         with FakeTensorMode():
             x = torch.rand([4, 4], device="cpu")
@@ -224,9 +243,9 @@ class FakeTensorTest(TestCase):
         with torch._subclasses.FakeTensorMode():
             out_fake = fn()
 
-        for a, b in zip(tree_flatten(out), tree_flatten(out_fake)):
-            if not isinstance(a, FakeTensor):
-                self.assertTrue(not isinstance(b, FakeTensor))
+        for a, b in zip(pytree.tree_leaves(out), pytree.tree_leaves(out_fake)):
+            if not isinstance(a, torch.Tensor):
+                self.assertTrue(not isinstance(b, torch.Tensor))
                 continue
 
             prims.utils.compare_tensor_meta(a, b, check_strides=True)
@@ -254,6 +273,7 @@ class FakeTensorTest(TestCase):
             with FakeTensorMode():
                 y = x[0]
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     def test_fake_grad_copy(self):
         x = torch.rand([4, 4], requires_grad=True)
         x.grad = torch.rand([4, 4])
@@ -263,6 +283,25 @@ class FakeTensorTest(TestCase):
         prims.utils.compare_tensor_meta(fake_x.grad, x.grad)
 
         self.assertTrue(isinstance(fake_x.grad, FakeTensor))
+
+    @unittest.skipIf(not RUN_CUDA, "requires cuda")
+    def test_index_put_error(self):
+        mode = FakeTensorMode()
+        for context in [contextlib.nullcontext, lambda: mode]:
+            with context():
+                y = torch.randn(2, 2, 3)
+                x = torch.randn(2, 2, 3).to('cuda')
+                with self.assertRaises(RuntimeError):
+                    x[[1, 1]] = y
+
+                with self.assertRaises(RuntimeError):
+                    torch.ops.aten.index_put(x, torch.tensor([1, 1], device="cuda"), y)
+
+                # no error
+                torch.ops.aten.index_put(x, torch.tensor([1, 1], device="cuda"), torch.tensor(5.))
+                torch.ops.aten.index_put_(x, torch.tensor([1, 1], device="cuda"), torch.tensor(5.))
+
+
 
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_like_constructor(self):
@@ -283,6 +322,7 @@ class FakeTensorTest(TestCase):
             self.assertEqual(out.dtype, torch.float)
             self.assertEqual(out.device.type, "cpu")
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     def test_from_numpy(self):
         with FakeTensorMode():
             x = torch.tensor(np.zeros([4, 4]))
@@ -354,6 +394,7 @@ class FakeTensorTest(TestCase):
                 x.add_(y)
 
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_normalize_device(self):
         with FakeTensorMode():
@@ -370,6 +411,7 @@ class FakeTensorTest(TestCase):
             y = x + x
             self.assertTrue(mode.in_kernel_invocation)
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     @skipIfRocm
     @parametrize("allow_fallback_kernels", [False, True],
                  lambda a: 'with_fallback' if a else 'without_fallback')
@@ -500,27 +542,60 @@ class FakeTensorTest(TestCase):
                 self.assertEqual(h_n.shape, (D * num_layers, N, H_out))
                 self.assertEqual(c_n.shape, (D * num_layers, N, hidden_size))
 
-    @skipIfRocm
-    @unittest.skipIf(not RUN_CUDA, "requires cuda")
-    def test_fallback_memory_prop(self):
-        m = nn.Conv2d(16, 33, 3, stride=2, device="cuda", dtype=torch.half)
-        m = m.to(memory_format=torch.channels_last)
-        mode = FakeTensorMode()
-        # TODO: module.to() doesn't work because it assigns .data, which is ignored
-        with torch._subclasses.fake_tensor.FakeCopyMode(mode):
-            mod_copied = copy.deepcopy(m)
-
-        with mode:
-            input = torch.rand(20, 16, 50, 100, dtype=torch.half, device="cuda").to(memory_format=torch.channels_last)
-            out = mod_copied(input)
-            self.assertTrue(out.is_contiguous(memory_format=torch.channels_last))
-            self.checkType(out, "cuda", [20, 33, 24, 49])
-
     def test_data_dependent_operator(self):
         with FakeTensorMode(allow_fallback_kernels=False):
             x = torch.rand([10, 10])
 
             self.assertRaises(DynamicOutputShapeException, lambda: torch.nonzero(x))
+
+    def test_tolist(self):
+        shape_env = ShapeEnv()
+        with FakeTensorMode(allow_fallback_kernels=False, shape_env=shape_env):
+            x = torch.rand([10])
+            x.tolist()
+
+    def test_same_shape_env_preserved(self):
+        shape_env = ShapeEnv()
+        mode1 = FakeTensorMode(shape_env=shape_env)
+        t1 = mode1.from_tensor(
+            torch.randn(10),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC],
+                constraint_sizes=[None]
+            )
+        )
+        mode2 = FakeTensorMode(shape_env=shape_env)
+        t2 = mode2.from_tensor(t1)
+        # t2.size(0) is still dynamic, even though we didn't pass DYNAMIC here
+        self.assertIsNot(t2, t1)
+        self.assertIs(t1.fake_mode, mode1)
+        self.assertIs(t2.fake_mode, mode2)
+        self.assertIs(t2.size(0).node.shape_env, t1.size(0).node.shape_env)
+        self.assertEqual(str(t2.size(0)), str(t1.size(0)))
+
+    def test_jagged_fake_to_fake_preserved(self):
+        from torch.nested._internal.nested_tensor import jagged_from_list
+
+        S0, S1, S2 = 3, 4, 5
+        D = 4
+        a = torch.randn(S0, D, requires_grad=True, dtype=torch.float64)
+        b = torch.randn(S1, D, requires_grad=True, dtype=torch.float64)
+        c = torch.randn(S2, D, requires_grad=True, dtype=torch.float64)
+        offsets = None
+        jt, _ = jagged_from_list([a, b, c], offsets)
+        shape_env = ShapeEnv()
+        mode1 = FakeTensorMode(shape_env=shape_env)
+        t1 = mode1.from_tensor(jt)
+        mode2 = FakeTensorMode(shape_env=shape_env)
+        t2 = mode2.from_tensor(t1)
+        # It's not obvious that the invocation above makes it dynamic but it
+        # does!
+        self.assertTrue(free_symbols(t1.size()))
+        self.assertIsNot(t2, t1)
+        self.assertIs(t1.offsets().fake_mode, mode1)
+        self.assertIs(t2.offsets().fake_mode, mode2)
+        self.assertIs(t2.size(1).node.shape_env, t1.size(1).node.shape_env)
+        self.assertEqual(str(t2.size(1)), str(t1.size(1)))
 
     def checkMetaProps(self, t1, t2):
         prims.utils.compare_tensor_meta(t1, t2, check_strides=True)
@@ -557,6 +632,7 @@ class FakeTensorTest(TestCase):
         self.assertIs(mod_copied.a, mod_copied.b)
         self.assertEqual(mod_copied.b.storage()._cdata, mod_copied.a.storage()._cdata)
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_new(self):
         with FakeTensorMode():
@@ -567,6 +643,7 @@ class FakeTensorTest(TestCase):
             self.checkType(b.new(device='cuda'), "cuda", [0])
             self.checkType(a.new(torch.rand([1])), "cpu", [1])
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     def test_scalar_inputs(self):
         with FakeTensorMode():
             self.checkType(torch.div(3, 2), "cpu", [])
@@ -574,6 +651,7 @@ class FakeTensorTest(TestCase):
             self.assertEqual(ten.dtype, torch.float)
             self.checkType(ten, "cpu", [2])
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     def test_allow_meta(self):
         def run_meta():
             with FakeTensorMode():
@@ -602,6 +680,7 @@ class FakeTensorTest(TestCase):
             self.assertEqual(r.size(), f.size())
             self.assertEqual(r.device, f.device)
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     def test_mixed_real_and_fake_inputs(self):
         class _TestPattern(torch.nn.Module):
             def __init__(self):
@@ -630,6 +709,7 @@ class FakeTensorTest(TestCase):
             out = mod(torch.randn(1, 1, 3, 3))
         self.checkType(out, "cpu", (1, 1, 3, 3))
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_aten_copy_multi_device(self):
         with FakeTensorMode():
@@ -643,6 +723,7 @@ class FakeTensorTest(TestCase):
         self.checkType(copy2, "cuda", (4,))
         self.checkType(out, "cpu", (4,))
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_aten_index_multi_device(self):
         with FakeTensorMode():
@@ -664,6 +745,7 @@ class FakeTensorTest(TestCase):
         self.checkType(r3, "cpu", (4, 4))
         self.checkType(r4, "cuda", (4, 4))
 
+    @unittest.skipIf(TEST_WITH_TORCHDYNAMO, "isinstance check for FakeTensor won't work with compile")
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_aten_slice_scatter_multi_device(self):
         with FakeTensorMode():
@@ -787,16 +869,11 @@ def contains_type(type: torch._C.Type, maybe_contained_type: torch._C.Type):
 class FakeTensorOpInfoTest(TestCase):
     @ops(custom_op_db, dtypes=OpDTypes.any_one)
     def test_fake(self, device, dtype, op):
-        data_dependent_outputs = {
-            'NumpyNMSCustomOp',
-            'NumpyNonzeroCustomOp',
-        }
-
         sample_inputs_itr = op.sample_inputs(device, dtype, requires_grad=False)
         for sample_input in sample_inputs_itr:
             args = (sample_input.input,) + sample_input.args
             kwargs = sample_input.kwargs
-            optests.fake_check(op, args, kwargs, op.name in data_dependent_outputs)
+            optests.fake_check(op, args, kwargs)
 
 
 class FakeTensorConverterTest(TestCase):
@@ -1016,31 +1093,38 @@ class FakeTensorOperatorInvariants(TestCase):
             self.assertEqual(ref.size(), meta_out.size())
 
     @skipIfRocm
-    @unittest.skipIf(not PLATFORM_SUPPORTS_FUSED_SDPA or not SM80OrLater, "Does not support SDPA or pre-SM80 hardware")
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FLASH_ATTENTION, "Does not support SDPA or pre-SM80 hardware")
     def test_flash_attention(self):
         class Repro(torch.nn.Module):
             def __init__(self):
                 super().__init__()
 
             def forward(self, arg1, arg2, arg3):
-                torch.ops.aten._scaled_dot_product_flash_attention(arg1, arg2, arg3)
+                torch.ops.aten._scaled_dot_product_flash_attention(arg1, arg2, arg3, scale=0.17677669529663687)
 
         args_new = [
-            ((1, 48, 64, 64), (0, 4096, 64, 1), torch.float16, "cuda"),
-            ((1, 48, 64, 64), (0, 4096, 64, 1), torch.float16, "cuda"),
-            ((1, 48, 64, 64), (0, 4096, 64, 1), torch.float16, "cuda"),
+            [
+                ((1, 48, 64, 64), (0, 4096, 64, 1), torch.float16, "cuda"),
+                ((1, 48, 64, 64), (0, 4096, 64, 1), torch.float16, "cuda"),
+                ((1, 48, 64, 64), (0, 4096, 64, 1), torch.float16, "cuda"),
+            ],
+            [
+                ((4, 2, 16, 32), (1024, 512, 32, 1), torch.float16, "cuda"),
+                ((4, 2, 16, 32), (1024, 512, 32, 1), torch.float16, "cuda"),
+                ((4, 2, 16, 32), (1024, 512, 32, 1), torch.float16, "cuda"),
+            ]
         ]
-
-        args = [rand_strided(bsz, num_heads, seq_len, head_dim) for
-                (bsz, num_heads, seq_len, head_dim) in args_new]
-        try:
-            with torch._subclasses.CrossRefFakeMode():
-                Repro()(*args)
-        except RuntimeError as e:
-            # We expect the cross ref to succed for the first output to fail
-            # for the rng state, see Note [Seed and Offset]
-            self.assertTrue("output[0]" not in str(e))
-            self.assertTrue("found mismatched tensor metadata for output[6]: Devices cpu and cuda:0 are not equal!" in str(e))
+        for args_list in args_new:
+            args = [rand_strided(bsz, num_heads, seq_len, head_dim) for
+                    (bsz, num_heads, seq_len, head_dim) in args_list]
+            try:
+                with torch._subclasses.CrossRefFakeMode():
+                    Repro()(*args)
+            except RuntimeError as e:
+                # We expect the cross ref to succed for the first output to fail
+                # for the rng state, see Note [Seed and Offset]
+                self.assertTrue("output[0]" not in str(e))
+                self.assertTrue("found mismatched tensor metadata for output[6]: Devices cpu and cuda:0 are not equal!" in str(e))
 
     @skipIfRocm
     @unittest.skipIf(not RUN_CUDA, "requires cuda")

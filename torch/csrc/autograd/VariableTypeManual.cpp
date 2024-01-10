@@ -9,7 +9,6 @@
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/functions/utils.h>
 #include <torch/csrc/autograd/generated/VariableType.h>
-#include <torch/csrc/utils/memory.h>
 #include <torch/library.h>
 
 #include <utility>
@@ -98,7 +97,7 @@ Tensor unpack_opt(const Tensor& t, const char* name, int pos) {
 }
 
 std::vector<at::Tensor> unpack(
-    at::ITensorListRef tl,
+    const at::ITensorListRef& tl,
     const char* name,
     int pos) {
   std::vector<at::Tensor> ret;
@@ -448,13 +447,13 @@ static Tensor detach(c10::DispatchKeySet ks, const Tensor& self) {
   // NB: we can't make detach() a normal view operator because the codegen
   // generates allow_tensor_metadata_change = True for them. In the future we
   // should have an option for this in the codegen.
-  std::function<at::Tensor(const at::Tensor&)> func = nullptr;
   auto result = as_view(
       /* base */ self,
       /* output */ out,
       /* is_bw_differentiable */ false,
       /* is_fw_differentiable */ false,
-      /* view_func */ std::move(func),
+      /* view_func */ nullptr,
+      /* rev_view_func */ nullptr,
       /* creation_meta */ CreationMeta::DEFAULT,
       /*allow_tensor_metadata_change=*/false);
 
@@ -470,10 +469,17 @@ static Tensor _fw_primal(
     return at::alias(self);
   })();
   std::function<at::Tensor(const at::Tensor&)> func = nullptr;
+  std::function<at::Tensor(const at::Tensor&)> rev_func = nullptr;
   if (!self.unsafeGetTensorImpl()->support_as_strided()) {
     auto size_vec = self.sizes().vec();
     func = [=](const at::Tensor& input_base) {
       return input_base.view(size_vec);
+    };
+    rev_func = [=](const at::Tensor& input_view) {
+      TORCH_INTERNAL_ASSERT(
+          false,
+          "Reverse view_func for _fw_primal() is not currently supported");
+      return Tensor();
     };
   }
   auto result = as_view(
@@ -482,6 +488,7 @@ static Tensor _fw_primal(
       /* is_bw_differentiable */ true,
       /* is_fw_differentiable */ false,
       /* view_func */ std::move(func),
+      /* rev_view_func */ std::move(rev_func),
       /* creation_meta */ CREATION_META_DEFINITION);
 
   return result;
@@ -498,10 +505,17 @@ static Tensor _make_dual(
     return at::alias(primal);
   })();
   std::function<at::Tensor(const at::Tensor&)> func = nullptr;
+  std::function<at::Tensor(const at::Tensor&)> rev_func = nullptr;
   if (!primal.unsafeGetTensorImpl()->support_as_strided()) {
     auto size_vec = primal.sizes().vec();
     func = [=](const at::Tensor& input_base) {
       return input_base.view(size_vec);
+    };
+    rev_func = [=](const at::Tensor& input_view) {
+      TORCH_INTERNAL_ASSERT(
+          false,
+          "Reverse view_func for _make_dual() is not currently supported");
+      return Tensor();
     };
   }
   auto result = as_view(
@@ -510,6 +524,7 @@ static Tensor _make_dual(
       /* is_bw_differentiable */ true,
       /* is_fw_differentiable */ false,
       /* view_func */ std::move(func),
+      /* rev_view_func */ std::move(rev_func),
       /* creation_meta */ CREATION_META_DEFINITION);
 
   return result;

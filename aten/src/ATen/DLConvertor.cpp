@@ -1,9 +1,6 @@
 #include <ATen/DLConvertor.h>
 #include <ATen/Functions.h>
 
-#include <iostream>
-#include <sstream>
-
 using namespace std;
 namespace at {
 
@@ -13,6 +10,9 @@ DLDataType getDLDataType(const Tensor& t) {
   dtype.bits = t.element_size() * 8;
   switch (t.scalar_type()) {
     case ScalarType::Byte:
+    case ScalarType::UInt16:
+    case ScalarType::UInt32:
+    case ScalarType::UInt64:
       dtype.code = DLDataTypeCode::kDLUInt;
       break;
     case ScalarType::Char:
@@ -39,7 +39,7 @@ DLDataType getDLDataType(const Tensor& t) {
       dtype.code = DLDataTypeCode::kDLFloat;
       break;
     case ScalarType::Bool:
-      TORCH_CHECK(false, "Bool type is not supported by dlpack");
+      dtype.code = DLDataTypeCode::kDLBool;
       break;
     case ScalarType::ComplexHalf:
       dtype.code = DLDataTypeCode::kDLComplex;
@@ -54,7 +54,9 @@ DLDataType getDLDataType(const Tensor& t) {
       dtype.code = DLDataTypeCode::kDLBfloat;
       break;
     case ScalarType::Float8_e5m2:
+    case ScalarType::Float8_e5m2fnuz:
     case ScalarType::Float8_e4m3fn:
+    case ScalarType::Float8_e4m3fnuz:
       TORCH_CHECK(false, "float8 types are not supported by dlpack");
       break;
     case ScalarType::QInt8:
@@ -210,6 +212,16 @@ ScalarType toScalarType(const DLDataType& dtype) {
         default:
           TORCH_CHECK(
               false, "Unsupported kFloat bits " + c10::to_string(dtype.bits));
+      }
+      break;
+    case DLDataTypeCode::kDLBool:
+      switch (dtype.bits) {
+        case 8:
+          stype = ScalarType::Bool;
+          break;
+        default:
+          TORCH_CHECK(
+              false, "Unsupported kDLBool bits " + c10::to_string(dtype.bits));
       }
       break;
     default:

@@ -4,10 +4,6 @@
 
 #if AT_CUDNN_ENABLED()
 
-#include <ATen/native/cudnn/Macros.h>
-
-#if HAS_CUDNN_V8()
-
 #include <ATen/cudnn/cudnn-wrapper.h>
 
 #include <c10/macros/Macros.h>
@@ -32,6 +28,7 @@ C10_DIAGNOSTIC_POP()
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include <unordered_map>
+#include <list>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -180,23 +177,75 @@ struct CacheKeyFusedWrapper : ParamsWrapper<CacheKeyFused> {
   }
 };
 
+static int getLRUCacheLimit() {
+  constexpr int DEFAULT_LIMIT = 10000; // roughly corresponds to 2GiB assuming 200KiB per ExecutionPlan
+  // 0 is used to indicate no limit
+  // negative values are used to indicate no caching
+  static int limit = [&] {
+    const char * val = getenv("TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT");
+    if (!val) {
+       return DEFAULT_LIMIT;
+    }
+    try {
+      return std::stoi(val);
+    } catch(std::invalid_argument const& e) {
+      TORCH_WARN("invalid TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT,",
+               " using default LRU cache limit of ", DEFAULT_LIMIT, " entries.");
+    } catch(std::out_of_range const& e) {
+      TORCH_WARN("invalid TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT,",
+                 " using default LRU cache limit of ", DEFAULT_LIMIT, " entries.");
+    }
+    return DEFAULT_LIMIT;
+  } ();
+  return limit;
+}
+
 template <typename T, typename KeyType>
 struct BenchmarkCache {
-std::unordered_map<KeyType, cudnn_frontend::ExecutionPlan, ParamsWrapperHash<KeyType>> engine_cache;
+std::list<KeyType> engine_cache_order;
+std::unordered_map<KeyType, std::pair<cudnn_frontend::ExecutionPlan, typename std::list<KeyType>::iterator>, ParamsWrapperHash<KeyType>> engine_cache;
 
 // no mutexes here as caches are now thread local for v8, can also return a pointer
 // to the Execution Plan if we know it will not be invalidated by another thread
 cudnn_frontend::ExecutionPlan* find(const KeyType& key) {
+  const int lru_cache_limit = getLRUCacheLimit();
+  if (lru_cache_limit < 0) {
+    return nullptr;
+  }
   auto it = engine_cache.find(key);
   if (it == engine_cache.end()) {
     return nullptr;
   }
-  return &(it->second);
+  if (lru_cache_limit) {
+    // update most recently accessed
+    engine_cache_order.splice(engine_cache_order.begin(), engine_cache_order, it->second.second);
+  }
+  return &(it->second.first);
 }
 
 void update(const KeyType& key, T& results) {
-  engine_cache.erase(key);
-  engine_cache.emplace(key, std::move(results));
+  int lru_cache_limit = getLRUCacheLimit();
+  if (lru_cache_limit < 0) {
+    return;
+  } else if (lru_cache_limit) {
+    auto it = engine_cache.find(key);
+    if (it == engine_cache.end()) {
+      if ((long) engine_cache.size() >= lru_cache_limit) {
+        auto erase_count = engine_cache.erase(engine_cache_order.back());
+        TORCH_INTERNAL_ASSERT(erase_count == 1, "CUDNN V8 LRU Cache Corrupted (eviction key not in map). Please report a bug to PyTorch.");
+        engine_cache_order.pop_back();
+      }
+      engine_cache_order.emplace_front(key);
+      engine_cache.emplace(key, std::make_pair(results, engine_cache_order.begin()));
+    } else {
+      it->second.first = results;
+      // update most recently accessed
+      engine_cache_order.splice(engine_cache_order.begin(), engine_cache_order, it->second.second);
+    }
+  } else {
+    engine_cache.erase(key);
+    engine_cache.emplace(key, std::make_pair(results, engine_cache_order.end())); // dummy iterator
+  }
 }
 
 };
@@ -727,5 +776,4 @@ void raw_cudnn_convolution_add_relu_out(
 
 }} // at::native
 
-#endif  // HAS_CUDNN_V8
 #endif  // AT_CUDNN_ENABLED

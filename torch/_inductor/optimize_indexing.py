@@ -9,11 +9,11 @@ from .utils import dominated_nodes
 
 
 def val_expressable_in_32_bits(val):
-    if hasattr(val, "is_Boolean") and val.is_Boolean:
+    if getattr(val, "is_Boolean", False):
         return True
 
     if isinstance(val, sympy.Expr):
-        assert val.is_constant()
+        assert val.is_number
         if val.is_Integer or val.is_Boolean:
             val = int(val)
         else:
@@ -54,7 +54,7 @@ def try_to_reduce_precision(node, bounds, indirect_vars, indices, replacement_va
         if dominated.target in ["store", "output"]:
             continue
 
-        if "set_indirect" in dominated.target:
+        if isinstance(dominated.target, str) and "set_indirect" in dominated.target:
             idx = int(dominated.target[len("set_indirect") :])
             indirect_var = indirect_vars[idx]
 

@@ -172,17 +172,15 @@ public:
     if (count == size())
       return _mm512_loadu_si512(reinterpret_cast<const __m512i*>(ptr));
 
-    __at_align__ int16_t tmp_values[size()];
-    std::memcpy(tmp_values, ptr, count * sizeof(int16_t));
-    return _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tmp_values));
+    __mmask32 mask = (1ULL << count) - 1;
+    return _mm512_maskz_loadu_epi16(mask, ptr);
   }
   void store(void* ptr, int count = size()) const {
     if (count == size()) {
       _mm512_storeu_si512(reinterpret_cast<__m512i*>(ptr), values);
     } else if (count > 0) {
-      __at_align__ int16_t tmp_values[size()];
-      _mm512_storeu_si512(reinterpret_cast<__m512i*>(tmp_values), values);
-      std::memcpy(ptr, tmp_values, count * sizeof(int16_t));
+      __mmask32 mask = (1ULL << count) - 1;
+      _mm512_mask_storeu_epi16(ptr, mask, values);
     }
   }
   template <int64_t mask>
@@ -352,6 +350,18 @@ public:
     const auto o2 = vop(hi);
     return cvt_from_fp32<T>(o1, o2);
   }
+  Vectorized<T> isnan() const {
+    __m512 lo, hi;
+    cvt_to_fp32<T>(values, lo, hi);
+    __mmask16 lo_mask, hi_mask;
+    __m512 zero = _mm512_set1_ps(0.0);
+    __m512i zeroi = _mm512_castps_si512(zero);
+    lo_mask = _mm512_cmp_ps_mask(lo, zero, _CMP_UNORD_Q);
+    lo = _mm512_castsi512_ps(_mm512_mask_set1_epi32(zeroi, lo_mask, 0xFFFF'FFFF));
+    hi_mask = _mm512_cmp_ps_mask(hi, zero, _CMP_UNORD_Q);
+    hi = _mm512_castsi512_ps(_mm512_mask_set1_epi32(zeroi, hi_mask, 0xFFFF'FFFF));
+    return merge_compare_result(lo, hi);
+  }
   #pragma clang diagnostic pop
   Vectorized<T> abs() const {
     return _mm512_andnot_si512(_mm512_set1_epi16(0x8000), values);
@@ -395,6 +405,9 @@ public:
   }
   Vectorized<T> atan() const {
     return map(Sleef_atanf16_u10);
+  }
+  Vectorized<T> atanh() const {
+    return map(Sleef_atanhf16_u10);
   }
   Vectorized<T> atan2(const Vectorized<T> &b) const {
     __m512 lo, hi;
@@ -443,6 +456,9 @@ public:
   Vectorized<T> expm1() const {
     return map(Sleef_expm1f16_u10);
   }
+  Vectorized<T> exp_u20() const {
+    return exp();
+  }
   Vectorized<T> fmod(const Vectorized<T> & q) const {
     __m512 x_lo, x_hi;
     cvt_to_fp32<T>(values, x_lo, x_hi);
@@ -486,6 +502,22 @@ public:
     for (auto i = decltype(sz){0}; i < sz / 2; i++) {
       tmp1[i] = calc_i0e(tmp1[i]);
       tmp2[i] = calc_i0e(tmp2[i]);
+    }
+    const auto o1 = _mm512_loadu_ps(tmp1);
+    const auto o2 = _mm512_loadu_ps(tmp2);
+    return cvt_from_fp32<T>(o1, o2);
+  }
+  Vectorized<T> digamma() const {
+    __m512 lo, hi;
+    cvt_to_fp32<T>(values, lo, hi);
+    constexpr auto sz = size();
+    __at_align__ float tmp1[sz / 2], tmp2[sz / 2];
+    _mm512_storeu_ps(reinterpret_cast<float*>(tmp1), lo);
+    _mm512_storeu_ps(reinterpret_cast<float*>(tmp2), hi);
+
+    for (auto i = decltype(sz){0}; i < sz / 2; i++) {
+      tmp1[i] = calc_digamma(tmp1[i]);
+      tmp2[i] = calc_digamma(tmp2[i]);
     }
     const auto o1 = _mm512_loadu_ps(tmp1);
     const auto o2 = _mm512_loadu_ps(tmp2);
