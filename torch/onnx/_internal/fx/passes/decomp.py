@@ -23,11 +23,13 @@ class Decompose(_pass.Transform):
         decomposition_table: Mapping[torch._ops.OpOverload, Callable],
         enable_dynamic_axes: bool,
         allow_fake_constant: Optional[bool] = False,
+        fake_mode: Optional[fake_tensor.FakeTensorMode] = None,
     ):
         super().__init__(diagnostic_context, module)
         self.decomposition_table = decomposition_table
         self.enable_dynamic_axes = enable_dynamic_axes
         self.allow_fake_constant = allow_fake_constant
+        self.fake_mode = fake_mode
 
     @_beartype.beartype
     def _run(self, *args, **kwargs) -> torch.fx.GraphModule:

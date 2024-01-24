@@ -812,7 +812,7 @@ class OrtBackend:
             # Extract inputs from metadata because they are tensors with dynamic shapes.
             # The input `args` are tensors with static shapes, so we don't want to use them.
             graph_module_args = [
-                node.meta["val"]
+                node.meta.get("val", node.meta.get("example_value"))
                 for node in graph_module.graph.nodes
                 if node.op == "placeholder"
             ]
@@ -822,15 +822,7 @@ class OrtBackend:
             # Instead of changing existing model, this step shall create a new model.
             # Otherwise, model caching mechanism will be broken and it will be hard to
             # debug mutable graphs.
-            modified_graph_module = common_pre_export_passes_shared_by_exporter_and_dynamo_backend(
-                self._resolved_onnx_exporter_options,
-                # Cannot copy.deepcopy(graph_module) because it leads to
-                # copying of OrtBackend.
-                graph_module,
-                graph_module_args,
-                # functionalization cannot be called from here.
-                functionalize_module=False,
-            )
+            modified_graph_module = graph_module
 
             if self._resolved_onnx_exporter_options.dynamic_shapes:
                 # No pre-allocation when dynamic shape is enabled.
@@ -876,13 +868,6 @@ class OrtBackend:
             fx_interpreter = fx_onnx_interpreter.FxOnnxInterpreter(
                 diagnostic_context=self._resolved_onnx_exporter_options.diagnostic_context
             )
-            # Cast FX variables if they will result schema-mismatch when searching
-            # for ONNX operator. E.g., add(double_tensor, int_tensor) is fine in PyTorch,
-            # but ONNX expects add(double_tensor, double_tensor).
-            modified_graph_module = torch.onnx._internal.fx.passes.InsertTypePromotion(
-                self._resolved_onnx_exporter_options.diagnostic_context,
-                modified_graph_module,
-            ).run()
             # Start the per-node exporting process. It's conceptually a for loop
             # scanning through the nodes in the graph.
             exported = fx_interpreter.run(
@@ -1016,7 +1001,19 @@ class OrtBackend:
         if graph_module in self._partitioner_cache:
             partitioned_prim_graph_module = self._partitioner_cache[graph_module]
         else:
-            prim_graph_module = graph_module
+
+            from torch._subclasses import fake_tensor
+            from torch.fx.experimental.proxy_tensor import maybe_disable_fake_tensor_mode
+            fresh_fake_mode = fake_tensor.FakeTensorMode(allow_non_fake_inputs=True)
+            prim_graph_module = torch.onnx._internal.fx.passes.Decompose(
+                self._resolved_onnx_exporter_options.diagnostic_context,
+                graph_module,
+                self._resolved_onnx_exporter_options.decomposition_table,
+                enable_dynamic_axes=self._resolved_onnx_exporter_options.dynamic_shapes,
+                allow_fake_constant=self._resolved_onnx_exporter_options.fake_context is not None,
+                fake_mode=fresh_fake_mode,
+            ).run(*args)
+
             partitioner = CapabilityBasedPartitioner(
                 prim_graph_module,
                 self._supported_ops,
