@@ -22,7 +22,8 @@ import torch._C
 import torch._ops
 import torch._prims.executor
 import torch.fx
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv, SymNode, DimDynamic
 from torch.fx._compatibility import compatibility
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.operator_support import OperatorSupport
@@ -811,18 +812,10 @@ class OrtBackend:
 
             # Extract inputs from metadata because they are tensors with dynamic shapes.
             # The input `args` are tensors with static shapes, so we don't want to use them.
-            graph_module_args = [
-                node.meta.get("val", node.meta.get("example_value"))
-                for node in graph_module.graph.nodes
-                if node.op == "placeholder"
-            ]
-
-            # This step mainly applies decomposition to the input graph.
-            # so that torch.relu becomes torch.ops.aten.relu.
-            # Instead of changing existing model, this step shall create a new model.
-            # Otherwise, model caching mechanism will be broken and it will be hard to
-            # debug mutable graphs.
-            modified_graph_module = graph_module
+            modified_graph_module = torch.onnx._internal.fx.passes.MovePlaceholderToFront(
+                self._resolved_onnx_exporter_options.diagnostic_context,
+                graph_module,
+            ).run()
 
             if self._resolved_onnx_exporter_options.dynamic_shapes:
                 # No pre-allocation when dynamic shape is enabled.
@@ -868,6 +861,10 @@ class OrtBackend:
             fx_interpreter = fx_onnx_interpreter.FxOnnxInterpreter(
                 diagnostic_context=self._resolved_onnx_exporter_options.diagnostic_context
             )
+            modified_graph_module = torch.onnx._internal.fx.passes.InsertTypePromotion(
+                self._resolved_onnx_exporter_options.diagnostic_context,
+                modified_graph_module,
+            ).run()
             # Start the per-node exporting process. It's conceptually a for loop
             # scanning through the nodes in the graph.
             exported = fx_interpreter.run(
@@ -1001,19 +998,78 @@ class OrtBackend:
         if graph_module in self._partitioner_cache:
             partitioned_prim_graph_module = self._partitioner_cache[graph_module]
         else:
-
-            from torch._subclasses import fake_tensor
             from torch.fx.experimental.proxy_tensor import maybe_disable_fake_tensor_mode
-            fresh_fake_mode = fake_tensor.FakeTensorMode(allow_non_fake_inputs=True)
-            prim_graph_module = torch.onnx._internal.fx.passes.Decompose(
-                self._resolved_onnx_exporter_options.diagnostic_context,
-                graph_module,
-                self._resolved_onnx_exporter_options.decomposition_table,
-                enable_dynamic_axes=self._resolved_onnx_exporter_options.dynamic_shapes,
-                allow_fake_constant=self._resolved_onnx_exporter_options.fake_context is not None,
-                fake_mode=fresh_fake_mode,
-            ).run(*args)
+            import itertools
 
+            new_shape_env = ShapeEnv()
+            new_fake_mode = FakeTensorMode(shape_env=new_shape_env, allow_non_fake_inputs=True)
+
+            def create_symtype(cls, pytype, shape_env, val):
+                from torch._dynamo.source import ConstantSource
+                symbol = shape_env.create_symbol(
+                    val,
+                    source=ConstantSource(f"__testing_only{len(shape_env.var_to_val)}"),
+                    dynamic_dim=DimDynamic.DUCK,
+                    constraint_dim=None,
+                )
+                return cls(SymNode(
+                    symbol,
+                    shape_env,
+                    pytype,
+                    hint=val,
+                ))
+
+            def create_symint(shape_env, i: int):
+                return create_symtype(torch.SymInt, int, shape_env, i)
+
+            def create_symbool(shape_env, b: bool):
+                return create_symtype(torch.SymBool, bool, shape_env, b)
+
+            def create_symfloat(shape_env, f: float):
+                return create_symtype(torch.SymFloat, float, shape_env, f)
+
+            def to_fake_tensor(x):
+                from torch._dynamo.source import ConstantSource
+                source = ConstantSource(f"onnxruntime")
+                if isinstance(x, FakeTensor):
+                    with new_fake_mode:
+                        return torch.empty_like(x)
+                if isinstance(x, torch.SymInt):
+                    return create_symint(new_shape_env, x.node.hint)
+                if isinstance(x, torch.SymBool):
+                    return create_symbool(new_shape_env, x.node.hint)
+                if isinstance(x, torch.SymFloat):
+                    return create_symfloat(new_shape_env, x.node.hint)
+                return x
+
+            fake_parameters_and_buffers = {
+                k: to_fake_tensor(v)
+                for k, v in itertools.chain(
+                    graph_module.named_parameters(), graph_module.named_buffers()
+                )
+            }
+
+            from torch.fx.experimental import proxy_tensor
+            from torch._dispatch import python as python_dispatch
+            import torch.fx.traceback as fx_traceback
+            with proxy_tensor.maybe_disable_fake_tensor_mode(), python_dispatch.enable_python_dispatcher(), torch.nn.utils.stateless._reparametrize_module(
+                graph_module, fake_parameters_and_buffers
+            ), new_fake_mode, fx_traceback.preserve_node_meta():
+                fake_args = tuple(to_fake_tensor(arg) for arg in args)
+                prim_graph_module = proxy_tensor.make_fx(
+                    graph_module,
+                    decomposition_table=self._resolved_onnx_exporter_options.decomposition_table,
+                    tracing_mode="real",
+                    _allow_non_fake_inputs=True,
+                )(*fake_args)
+
+            FakeTensorProp(prim_graph_module, mode=new_fake_mode).propagate(
+                *fake_args
+            )
+
+            prim_graph_module.graph.print_tabular()
+            for node in prim_graph_module.graph.nodes:
+                print(node.meta)
             partitioner = CapabilityBasedPartitioner(
                 prim_graph_module,
                 self._supported_ops,
